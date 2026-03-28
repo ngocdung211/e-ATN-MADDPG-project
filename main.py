@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from ultils.graph_utils import extract_gcn_inputs
-from environment.task_dag import TaskDAG, Subtask
+from ultils.graph_ultils import extract_gcn_inputs
+from environment.system_model import TaskDAG, Subtask
 
 # Sửa lại import theo đúng cấu trúc thư mục
 from environment.network_env import NetworkEnvironment
@@ -12,7 +12,7 @@ from models.replay_buffer import MultiAgentReplayBuffer
 from models.maddpg import EpsilonATNMADDPGAgent
 from models.gcn import TaskPriorityGCN
 from dataset.data_loader import KolektorSDDLoader
-from utils.plotter import DITENPlotter
+from ultils.plotter import DITENPlotter
 
 def generate_task_dags_for_episode(devices, data_loader):
     """ Hàm phụ trợ: Sinh TaskDAG thực tế từ ảnh Dataset cho từng thiết bị """
