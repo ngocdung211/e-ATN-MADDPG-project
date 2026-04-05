@@ -1,0 +1,6 @@
+# Image Processing (For KolektorSDD Dataset loader)
+Pillow>=8.4.0
+
+# Plotting and Visualization
+matplotlib>=3.4.3
+seaborn>=0.11.2
