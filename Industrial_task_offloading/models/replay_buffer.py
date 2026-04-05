@@ -2,6 +2,7 @@ import random
 import torch
 from collections import deque
 from typing import Tuple, List
+import numpy as np
 
 class MultiAgentReplayBuffer:
     """
@@ -23,10 +24,10 @@ class MultiAgentReplayBuffer:
         """
         batch = random.sample(self.buffer, batch_size)
         
-        state_batch = torch.FloatTensor([exp[0] for exp in batch])
-        action_batch = torch.FloatTensor([exp[1] for exp in batch])
-        reward_batch = torch.FloatTensor([exp[2] for exp in batch])
-        next_state_batch = torch.FloatTensor([exp[3] for exp in batch])
+        state_batch = torch.FloatTensor(np.array([exp[0] for exp in batch]))
+        action_batch = torch.FloatTensor(np.array([exp[1] for exp in batch]))
+        reward_batch = torch.FloatTensor(np.array([exp[2] for exp in batch]))
+        next_state_batch = torch.FloatTensor(np.array([exp[3] for exp in batch]))
         
         return state_batch, action_batch, reward_batch, next_state_batch
 

@@ -99,12 +99,14 @@ class DITENEnv:
 
     def _get_joint_state(self) -> np.ndarray:
         # Tạm giữ logic get state của bạn (nên mở rộng thêm đặc trưng subtask hiện tại sau)
+        # TODO: Chưa có thể hiện được server nào được kết nối với thiết bị nào, có thể thêm vào state vector sau này
+        # TODO: Cần thêm đặc trưng của subtask hiện tại (ví dụ: CPU cycles còn lại, data size, result size) vào state vector để agent có thể học được mối quan hệ giữa task và môi trường.
         joint_state = []
         for device in self.devices:
             f_loc = device.compute_power
             w_d = self.device_accumulated_delay[device.id]
             edge_f = [s.compute_power for s in self.servers]
-            edge_w = [0.0 for s in self.servers] # Tạm bỏ qua server queue để tránh rối
+            edge_w = [0.0 for s in self.servers] #TODO: Tính toán lại edge_w dựa trên khoảng cách và bandwidth
             
             state_vector = [f_loc, w_d] + edge_f + edge_w 
             joint_state.append(state_vector)

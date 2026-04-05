@@ -1,7 +1,8 @@
+from environment.system_model import TaskDAG
 import numpy as np
 import torch
 
-def extract_gcn_inputs(task_dag):
+def extract_gcn_inputs(task_dag : TaskDAG):
     """
     Trích xuất Ma trận kề (A) và Ma trận đặc trưng (X) từ TaskDAG.
     Đặc trưng X gồm 3 chiều: [hierarchy_level, out_degree, computation_volume]
@@ -20,7 +21,7 @@ def extract_gcn_inputs(task_dag):
         # Out-degree: Số lượng subtask con phụ thuộc trực tiếp vào nó
         out_degree = sum(1 for p, s in task_dag.edges if p == sub_id)
         
-        # Gán vào ma trận X (chuẩn hóa computation_volume để tránh tràn số)
+        #List properties of subtask
         X[idx, 0] = 1.0                     # Tạm gán hierarchy level tĩnh
         X[idx, 1] = float(out_degree)
         X[idx, 2] = subtask.cpu_cycles / 1e6 # Scale down CPU cycles

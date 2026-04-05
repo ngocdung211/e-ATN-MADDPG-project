@@ -1,3 +1,5 @@
+from typing import List, Tuple, Dict
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,12 +16,14 @@ from models.gcn import TaskPriorityGCN
 from dataset.data_loader import KolektorSDDLoader
 from ultils.plotter import DITENPlotter
 
-def generate_task_dags_for_episode(devices, data_loader):
+#update 12:20 2026-05-04
+
+def generate_task_dags_for_episode(devices, data_loader: KolektorSDDLoader):
     """ Hàm phụ trợ: Sinh TaskDAG thực tế từ ảnh Dataset cho từng thiết bị """
     task_dags = {}
     for device in devices:
         task_params = data_loader.get_random_task_parameters()
-        task_dag = TaskDAG(task_id=device.id, t_max=1.0, e_max=12.0)
+        task_dag = TaskDAG(task_id=device.id, t_max=1.0, e_max=1.0)
         
         for i in range(1, 6):
             params = task_params[f"subtask_{i}"]
@@ -35,7 +39,7 @@ def generate_task_dags_for_episode(devices, data_loader):
         task_dags[device.id] = task_dag
     return task_dags
 
-def train_maddpg(agents, devices, env, replay_buffer, gcn_model, data_loader, num_episodes=1000, batch_size=64, gamma=0.99):
+def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDevice], env: DITENEnv, replay_buffer: MultiAgentReplayBuffer, gcn_model : TaskPriorityGCN, data_loader: KolektorSDDLoader, num_episodes=1000, batch_size=64, gamma=0.99):
     num_agents = len(agents)
     rewards_history = [] 
     
@@ -68,31 +72,33 @@ def train_maddpg(agents, devices, env, replay_buffer, gcn_model, data_loader, nu
                 joint_actions.append(action)
                 
             next_joint_state, joint_rewards, done, _ = env.step(joint_actions)
+            #TODO The contribution of each agent's need to be weighted. Should improve the reward function
             episode_reward += sum(joint_rewards) / num_agents
             
             replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
             current_joint_state = next_joint_state
         
-        # --- Network Updates (Giữ nguyên logic cũ của bạn ở đây) ---
         if len(replay_buffer) >= batch_size:
             for i, agent in enumerate(agents):
                 state_b, action_b, reward_b, next_state_b = replay_buffer.sample(batch_size)
                 agent_rewards = reward_b[:, i].unsqueeze(1)
-                
+                action_dim = agent.action_dim
+                action_b_onehot = F.one_hot(action_b.long(), num_classes=action_dim).float()
+
                 with torch.no_grad():
                     target_joint_actions = torch.stack([a.target_actor(next_state_b[:, j, :]) for j, a in enumerate(agents)], dim=1)
                     target_q = agent.target_critic(next_state_b, target_joint_actions)
                     y_i = agent_rewards + gamma * target_q
                 
-                current_q = agent.critic(state_b, action_b)
+                current_q = agent.critic(state_b, action_b_onehot)
                 critic_loss = F.mse_loss(current_q, y_i)
                 agent.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 agent.critic_optimizer.step()
                 
                 predicted_actions = agent.actor(state_b[:, i, :])
-                predicted_joint_actions = action_b.clone()
-                predicted_joint_actions[:, i] = predicted_actions.argmax(dim=1).float()
+                predicted_joint_actions = action_b_onehot.clone()
+                predicted_joint_actions[:, i] = predicted_actions
                 
                 actor_loss = -agent.critic(state_b, predicted_joint_actions).mean()
                 agent.actor_optimizer.zero_grad()
@@ -133,7 +139,7 @@ if __name__ == "__main__":
             compute_power=f_edge,
             transmit_power=1.2,                     # 1.2 W
             energy_coeff=1e-27,                     # \tau_j^{edge} = 10^-27
-            coverage_radius=20.0
+            coverage_radius=12
         )
         servers.append(server)
 
@@ -160,16 +166,13 @@ if __name__ == "__main__":
     # Action: 0 (Local) hoặc 1, 2, 3 (Các Server) -> 4 options
     ACTION_DIM = 1 + NUM_SERVERS
     
-    JOINT_STATE_DIM = STATE_DIM * NUM_DEVICES
-    JOINT_ACTION_DIM = NUM_DEVICES
     
     agents = []
     for _ in range(NUM_DEVICES):
         agent = EpsilonATNMADDPGAgent(
             state_dim=STATE_DIM,
             action_dim=ACTION_DIM,
-            joint_state_dim=JOINT_STATE_DIM,
-            joint_action_dim=JOINT_ACTION_DIM,
+            num_agents=NUM_DEVICES,
             lr=0.0001  # Learning rate tối ưu theo bài báo
         )
         agents.append(agent)

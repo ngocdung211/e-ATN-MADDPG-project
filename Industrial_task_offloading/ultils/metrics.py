@@ -2,10 +2,12 @@ def compute_reward(t_max: float, e_max: float, m_total: int,
                    t_im: float, e_im: float, 
                    t_accm: float, e_accm: float, 
                    p_out: float, 
-                   lambdas: tuple = (1.0, 1.0, 1.0, 1.0, 1.0)) -> float:
+                   lambdas: tuple = (0.2, 0.2 , 0.2, 0.2, 0.2)) -> float:
     """
     Calculates the reward for an offloading decision based on Equation 24.
     """
+
+    #TODO: Need to modify lamda 
     l1, l2, l3, l4, l5 = lambdas
     
     # 1. Subtask Delay Reward: Encourages beating the average time allowance

@@ -5,6 +5,7 @@ class NetworkEnvironment:
     """
     Handles the communication and computation mathematical models.
     """
+    # Công thức Python (10 ** (noise_power_dbm / 10)) / 1000: Đây chính là công thức toán học chuẩn bị ép kiểu từ dBm sang W
     def __init__(self, bandwidth: float, noise_power_dbm: float):
         self.B = bandwidth  # Subchannel bandwidth (e.g., 10 MHz)
         # Convert background noise from dBm to linear scale (Watts)

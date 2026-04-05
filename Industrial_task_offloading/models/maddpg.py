@@ -41,27 +41,28 @@ class CriticNetwork(nn.Module):
     """
     The Critic evaluates the joint state and action space using Self-Attention.
     """
-    def __init__(self, joint_state_dim: int, joint_action_dim: int, hidden_dim: int = 64):
+    def __init__(self, state_dim: int, action_dim: int, num_agents : int, hidden_dim: int = 64):
         super(CriticNetwork, self).__init__()
-        input_dim = joint_state_dim + joint_action_dim
+        feature_dim = state_dim + action_dim
         
         # Self-attention requires a sequence. We will treat the concatenated
         # joint state and action as a sequence of length 1 for simplicity, 
         # or you can split features if treating agents as sequence elements.
-        self.attention = SelfAttention(feature_dim=input_dim, attention_dim=hidden_dim)
+        self.attention = SelfAttention(feature_dim=feature_dim, attention_dim=hidden_dim)
         
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc1 = nn.Linear(num_agents*feature_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1) # Outputs a single Q-value
 
-    def forward(self, joint_states: torch.Tensor, joint_actions: torch.Tensor) -> torch.Tensor:
+    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         # Concatenate states and actions
-        x = torch.cat([joint_states, joint_actions], dim=-1)
+        x = torch.cat([states, actions], dim=-1)
         
         # Apply self-attention (unsqueeze to add sequence dimension)
-        x = x.unsqueeze(1)
+        # x = x.unsqueeze(1)
         x = self.attention(x)
-        x = x.squeeze(1)
+        # x = x.squeeze(1)
+        x = x.view(x.size(0), -1)
         
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -91,7 +92,7 @@ class EpsilonATNMADDPGAgent:
     """
     Wrapper for an individual agent managing its Actor, Critic, and epsilon-greedy logic.
     """
-    def __init__(self, state_dim: int, action_dim: int, joint_state_dim: int, joint_action_dim: int, 
+    def __init__(self, state_dim: int, action_dim: int, num_agents: int,
                  lr: float = 0.0001, epsilon_init: float = 1.0, epsilon_min: float = 0.01, decay: float = 0.995):
         self.action_dim = action_dim
         
@@ -100,8 +101,8 @@ class EpsilonATNMADDPGAgent:
         self.target_actor = ActorNetwork(state_dim, action_dim)
         self.target_actor.load_state_dict(self.actor.state_dict())
         
-        self.critic = CriticNetwork(joint_state_dim, joint_action_dim)
-        self.target_critic = CriticNetwork(joint_state_dim, joint_action_dim)
+        self.critic = CriticNetwork(state_dim, action_dim, num_agents)
+        self.target_critic = CriticNetwork(state_dim, action_dim, num_agents)
         self.target_critic.load_state_dict(self.critic.state_dict())
         
         # Optimizers (learning rate of 0.0001 as proven optimal in the paper)
