@@ -93,7 +93,7 @@ class EpsilonATNMADDPGAgent:
     Wrapper for an individual agent managing its Actor, Critic, and epsilon-greedy logic.
     """
     def __init__(self, state_dim: int, action_dim: int, num_agents: int,
-                 lr: float = 0.0001, epsilon_init: float = 1.0, epsilon_min: float = 0.01, decay: float = 0.995):
+                 lr: float = 0.0001, epsilon_init: float = 1.0, epsilon_min: float = 0.01, decay: float = 0.998):
         self.action_dim = action_dim
         
         # Networks

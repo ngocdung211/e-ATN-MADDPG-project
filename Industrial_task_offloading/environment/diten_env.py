@@ -70,7 +70,7 @@ class DITENEnv:
                 # Kiểm tra ngắt kết nối: Nếu thiết bị di chuyển ra khỏi vùng phủ sóng (Bán kính 20m)
                 distance = np.linalg.norm(device.location - server.location)
                 if distance > server.coverage_radius:
-                    p_out = -10.0 # Bị phạt nặng nếu mất kết nối
+                    p_out = -2.0 # Bị phạt nặng nếu mất kết nối
             
             # Cộng dồn Cost (Cumulative)
             t_accm = self.device_accumulated_delay[device.id]

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from ultils.graph_ultils import extract_gcn_inputs
 from environment.system_model import TaskDAG, Subtask
+import time
 
 # Sửa lại import theo đúng cấu trúc thư mục
 from environment.network_env import NetworkEnvironment
@@ -39,7 +40,7 @@ def generate_task_dags_for_episode(devices, data_loader: KolektorSDDLoader):
         task_dags[device.id] = task_dag
     return task_dags
 
-def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDevice], env: DITENEnv, replay_buffer: MultiAgentReplayBuffer, gcn_model : TaskPriorityGCN, data_loader: KolektorSDDLoader, num_episodes=1000, batch_size=64, gamma=0.99):
+def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDevice], env: DITENEnv, replay_buffer: MultiAgentReplayBuffer, gcn_model : TaskPriorityGCN, data_loader: KolektorSDDLoader, num_episodes=2000, batch_size=64, gamma=0.99):
     num_agents = len(agents)
     rewards_history = [] 
     
@@ -207,12 +208,12 @@ if __name__ == "__main__":
     data_to_plot = {
         "e-ATN-MADDPG": e_atn_rewards
     }
-    
+    date_string = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     plotter.plot_training_curve(
         data_dict=data_to_plot,
         title="Training Reward of e-ATN-MADDPG",
         ylabel="Average Reward",
-        filename="training_reward_curve.png"
+        filename=f"training_reward_curve_{date_string}.png"
     )
     
     print("All processes completed successfully!")

@@ -2,7 +2,7 @@ def compute_reward(t_max: float, e_max: float, m_total: int,
                    t_im: float, e_im: float, 
                    t_accm: float, e_accm: float, 
                    p_out: float, 
-                   lambdas: tuple = (0.2, 0.2 , 0.2, 0.2, 0.2)) -> float:
+                   lambdas: tuple = (0.2, 0.2 , 0.2, 0.2, 1)) -> float:
     """
     Calculates the reward for an offloading decision based on Equation 24.
     """
