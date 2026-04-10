@@ -41,7 +41,7 @@ class CriticNetwork(nn.Module):
     """
     The Critic evaluates the joint state and action space using Self-Attention.
     """
-    def __init__(self, state_dim: int, action_dim: int, num_agents : int, hidden_dim: int = 64):
+    def __init__(self, state_dim: int, action_dim: int, num_agents : int, hidden_dim: int = 64, use_attention: bool = True):
         super(CriticNetwork, self).__init__()
         feature_dim = state_dim + action_dim
         
