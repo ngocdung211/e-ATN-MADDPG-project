@@ -16,6 +16,14 @@ from models.maddpg import EpsilonATNMADDPGAgent
 from models.gcn import TaskPriorityGCN
 from dataset.data_loader import KolektorSDDLoader
 from ultils.plotter import DITENPlotter
+from ultils.plotter2 import DITENPlotter2
+
+import random
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    random.seed(seed)
 
 #update 12:20 2026-05-04
 
@@ -120,7 +128,7 @@ def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDe
 # ==========================================
 if __name__ == "__main__":
     print("Initializing Simulation Environment...")
-    
+    set_seed(42)  # Đảm bảo tính tái lập
     # 1. Cài đặt thông số mạng (Dựa theo Table II của bài báo)
     BANDWIDTH = 10e6        # 10 MHz
     NOISE_POWER = -43       # -43 dBm
@@ -215,5 +223,6 @@ if __name__ == "__main__":
         ylabel="Average Reward",
         filename=f"training_reward_curve_{date_string}.png"
     )
+    
     
     print("All processes completed successfully!")

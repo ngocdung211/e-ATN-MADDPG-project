@@ -93,16 +93,19 @@ class EpsilonATNMADDPGAgent:
     Wrapper for an individual agent managing its Actor, Critic, and epsilon-greedy logic.
     """
     def __init__(self, state_dim: int, action_dim: int, num_agents: int,
-                 lr: float = 0.0001, epsilon_init: float = 1.0, epsilon_min: float = 0.01, decay: float = 0.998):
+                 lr: float = 0.0001, epsilon_init: float = 1.0, epsilon_min: float = 0.01, decay: float = 0.998, use_attention: bool = True, use_epsilon_greedy: bool = True):
         self.action_dim = action_dim
+
+        self.action_dim = action_dim
+        self.use_epsilon_greedy = use_epsilon_greedy
         
         # Networks
         self.actor = ActorNetwork(state_dim, action_dim)
         self.target_actor = ActorNetwork(state_dim, action_dim)
         self.target_actor.load_state_dict(self.actor.state_dict())
         
-        self.critic = CriticNetwork(state_dim, action_dim, num_agents)
-        self.target_critic = CriticNetwork(state_dim, action_dim, num_agents)
+        self.critic = CriticNetwork(state_dim, action_dim, num_agents, use_attention=use_attention)
+        self.target_critic = CriticNetwork(state_dim, action_dim, num_agents, use_attention=use_attention)
         self.target_critic.load_state_dict(self.critic.state_dict())
         
         # Optimizers (learning rate of 0.0001 as proven optimal in the paper)
@@ -119,7 +122,7 @@ class EpsilonATNMADDPGAgent:
         Implements the epsilon-greedy action selection strategy.
         """
         # Random exploration
-        if random.random() < self.epsilon:
+        if self.use_epsilon_greedy and random.random() < self.epsilon:
             return random.randint(0, self.action_dim - 1)
         
         # Exploitation based on policy
@@ -129,7 +132,8 @@ class EpsilonATNMADDPGAgent:
 
     def update_epsilon(self):
         """Decays epsilon over time to shift from exploration to exploitation."""
-        self.epsilon = max(self.epsilon * self.decay, self.epsilon_min)
+        if self.use_epsilon_greedy:
+            self.epsilon = max(self.epsilon * self.decay, self.epsilon_min)
 
     def soft_update(self, target_net: nn.Module, source_net: nn.Module, tau: float = 0.01):
         """Soft updates target network parameters."""

@@ -14,11 +14,7 @@ from models.gcn import TaskPriorityGCN
 from models.maddpg import EpsilonATNMADDPGAgent
 from ultils.graph_ultils import extract_gcn_inputs
 from ultils.plotter import DITENPlotter
-
-# TODO: Import your future baselines here once created
-# from baselines.maac import MAACAgent
-# from baselines.mappo import MAPPOAgent
-
+from ultils.plotter2 import DITENPlotter2
 def set_seed(seed=42):
     """Ensure reproducibility across different algorithm runs."""
     np.random.seed(seed)
@@ -54,15 +50,15 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
     # State/Action dimensions
     STATE_DIM = 2 + len(servers) * 2
     ACTION_DIM = 1 + len(servers)
-    JOINT_STATE_DIM = STATE_DIM * len(devices)
-    JOINT_ACTION_DIM = len(devices)
+    # JOINT_STATE_DIM = STATE_DIM * len(devices)
+    # JOINT_ACTION_DIM = len(devices)
     
     # Initialize Agents dynamically based on the config
     agents = []
     for _ in range(len(devices)):
         agent = agent_config["class"](
             state_dim=STATE_DIM, action_dim=ACTION_DIM, 
-            joint_state_dim=JOINT_STATE_DIM, joint_action_dim=JOINT_ACTION_DIM,
+            num_agents= len(devices),
             **agent_config.get("kwargs", {})
         )
         agents.append(agent)
@@ -117,8 +113,11 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
         if len(replay_buffer) >= batch_size:
             state_b, action_b, reward_b, next_state_b = replay_buffer.sample(batch_size)
             
+            
             for i, agent in enumerate(agents):
                 # --> NEW: If it's MAAC or MAPPO, let it handle its own update
+                action_dim = agent.action_dim
+                action_b_onehot = F.one_hot(action_b.long(), num_classes=action_dim).float()
                 if hasattr(agent, 'update_agent'):
                     agent.update_agent(state_b, action_b, reward_b, next_state_b, agent_index=i)
                     
@@ -130,16 +129,20 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
                         target_q = agent.target_critic(next_state_b, target_joint_actions)
                         y_i = agent_rewards + gamma * target_q
                         
-                    current_q = agent.critic(state_b, action_b)
+                    current_q = agent.critic(state_b, action_b_onehot)
                     critic_loss = F.mse_loss(current_q, y_i)
                     agent.critic_optimizer.zero_grad()
                     critic_loss.backward()
                     agent.critic_optimizer.step()
                     
-                    predicted_actions = agent.actor(state_b[:, i, :])
-                    predicted_joint_actions = action_b.clone()
-                    predicted_joint_actions[:, i] = predicted_actions.argmax(dim=1).float()
+                    # predicted_actions = agent.actor(state_b[:, i, :])
+                    # predicted_joint_actions = action_b.clone()
+                    # predicted_joint_actions[:, i] = predicted_actions.argmax(dim=1).float()
                     
+                    predicted_actions = agent.actor(state_b[:, i, :])
+                    predicted_joint_actions = action_b_onehot.clone()
+                    predicted_joint_actions[:, i] = predicted_actions
+
                     actor_loss = -agent.critic(state_b, predicted_joint_actions).mean()
                     agent.actor_optimizer.zero_grad()
                     actor_loss.backward()
@@ -180,10 +183,10 @@ if __name__ == "__main__":
 
     # 2. Define Algorithms to Compare
     algorithms = {
-        "MADDPG": {
-            "class": EpsilonATNMADDPGAgent, 
-            "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001}
-        },
+        # "MADDPG": {
+        #     "class": EpsilonATNMADDPGAgent, 
+        #     "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001}
+        # },
         "GR-MADDPG": {
             "class": EpsilonATNMADDPGAgent, 
             "kwargs": {"use_attention": False, "use_epsilon_greedy": True, "lr": 0.0001}
@@ -193,13 +196,13 @@ if __name__ == "__main__":
             "kwargs": {"use_attention": True, "use_epsilon_greedy": False, "lr": 0.0001}
         },
         "e-ATN-MADDPG": {
-            "class": EpsilonATNMADDPGAgent, 
+            "class": EpsilonATNMADDPGAgent,
             "kwargs": {"use_attention": True, "use_epsilon_greedy": True, "lr": 0.0001}
-        },
+        }
         # Uncomment when implemented:
-        "MAAC": {"class": MAACAgent, "kwargs": {"lr": 0.0001}},
+        # "MAAC": {"class": MAACAgent, "kwargs": {"lr": 0.0001}},
 
-        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": 0.0001}}
+        # "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": 0.0001}}
     }
 
     # 3. Run Comparisons
@@ -214,7 +217,7 @@ if __name__ == "__main__":
 
     # 4. Plotting Results
     print("\nAll training complete! Generating comparison plots...")
-    plotter = DITENPlotter()
+    plotter = DITENPlotter2()
     
     # Plot Reward (Like Fig. 8)
     plotter.plot_training_curve(
