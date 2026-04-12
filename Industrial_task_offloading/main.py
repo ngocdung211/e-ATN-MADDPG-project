@@ -73,6 +73,8 @@ def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDe
         episode_reward = 0
         
         # Vòng lặp này giờ sẽ lặp đúng M lần (M = số lượng subtask = 5)
+        # time slot should change to miliseconds to better reflect the real-world scenario
+        # TODO: Modify time TIME_SLOTS
         while not done:
             joint_actions = []
             for i, agent in enumerate(agents):
@@ -167,6 +169,7 @@ if __name__ == "__main__":
         
     # 4. Khởi tạo DITEN Environment
     # env = DITENEnv(devices, servers, network_env, time_slots=TIME_SLOTS)
+    # TODO: The env dont have time slot right now, need to add time slot
     env = DITENEnv(devices, servers, network_env)
     # 5. Khởi tạo DRL Agents (\epsilon-ATN-MADDPG)
     # Xác định kích thước State và Action
@@ -187,6 +190,7 @@ if __name__ == "__main__":
         agents.append(agent)
 
     # Khởi tạo GCN và Replay Buffer
+    # TODO: Have not train and show the inportance of the task.
     gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
     replay_buffer = MultiAgentReplayBuffer(capacity=100000)
     

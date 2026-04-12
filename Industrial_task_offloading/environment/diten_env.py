@@ -13,6 +13,10 @@ class DITENEnv:
         # Trạng thái cộng dồn
         self.device_accumulated_delay = {}
         self.device_accumulated_energy = {}
+
+        self.subtask_finish_times = {d.id: {} for d in self.devices}
+        self.subtask_locations = {d.id: {} for d in self.devices}
+        
         
         # Dữ liệu task cho từng episode
         self.task_dags = {}
@@ -26,9 +30,11 @@ class DITENEnv:
         self.task_dags = task_dags
         self.priorities = priorities
         self.current_step = 0
-        
+
         self.device_accumulated_delay = {d.id: 0.0 for d in self.devices}
         self.device_accumulated_energy = {d.id: 0.0 for d in self.devices}
+        
+        
         
         for d in self.devices:
             # Khởi tạo hướng di chuyển ngẫu nhiên
@@ -47,6 +53,8 @@ class DITENEnv:
             # Lấy ID của subtask hiện tại dựa vào thứ tự ưu tiên (GCN cung cấp)
             current_subtask_id = self.priorities[device.id][self.current_step]
             subtask = task_dag.subtasks[current_subtask_id]
+
+            
             
             # Lấy thông số thực tế từ Dataset
             cpu_cycles = subtask.cpu_cycles
@@ -54,16 +62,46 @@ class DITENEnv:
             t_im = 0.0
             e_im = 0.0
             p_out = 0.0 
+
+            predecessors = [pred for pred, succ in task_dag.edges if succ == current_subtask_id]
+            ready_time = 0.0
+            max_trans_delay = 0.0
+            trans_delay = 0.0
+
+            for p_id in predecessors:
+                p_finish = self.subtask_finish_times[device.id].get(p_id, 0.0)
+                p_loc = self.subtask_locations[device.id].get(p_id, 0)
+                
+                if p_loc != action:
+                    if action == 0: # Edge truyền về Local
+                        server = self.servers[p_loc - 1]
+                        g_ij = self.network_env.calculate_channel_gain(device.location, server.location)
+                        rate_down = self.network_env.get_downlink_rate(server.transmit_power, g_ij)
+                        # Cộng thêm thời gian truyền (data_size của subtask trước / rate)
+                        trans_delay = task_dag.subtasks[p_id].result_size / rate_down
+
+                    else: # Local truyền lên Edge
+                        server = self.servers[action - 1]
+                        g_ij = self.network_env.calculate_channel_gain(device.location, server.location)
+                        rate_up = self.network_env.get_uplink_rate(device.transmit_power, g_ij)
+                        trans_delay = task_dag.subtasks[p_id].result_size / rate_up
+                        # Cộng thêm năng lượng truyền tải cho thiết bị
+                        e_im += device.transmit_power * trans_delay
+                    
+                    p_finish += trans_delay
+                
+                ready_time = max(ready_time, p_finish)
+                max_trans_delay = max(max_trans_delay, trans_delay)
             
             if action == 0:
                 # Tính toán Local
-                t_im, e_im = self.network_env.calculate_local_computation(
+                t_comp, e_comp = self.network_env.calculate_local_computation(
                     cpu_cycles, device.energy_coeff, device.compute_power, device.compute_power
                 )
             else:
                 # Tính toán Edge
                 server = self.servers[action - 1] 
-                t_im, e_im = self.network_env.calculate_edge_computation(
+                t_comp, e_comp = self.network_env.calculate_edge_computation(
                     cpu_cycles, server.energy_coeff, server.compute_power, server.compute_power
                 )
                 
@@ -72,6 +110,13 @@ class DITENEnv:
                 if distance > server.coverage_radius:
                     p_out = -2.0 # Bị phạt nặng nếu mất kết nối
             
+            t_im = max_trans_delay + t_comp 
+            e_im += e_comp
+
+            finish_time = ready_time + t_im
+
+            self.subtask_finish_times[device.id][current_subtask_id] = finish_time
+            self.subtask_locations[device.id][current_subtask_id] = action
             # Cộng dồn Cost (Cumulative)
             t_accm = self.device_accumulated_delay[device.id]
             e_accm = self.device_accumulated_energy[device.id]
@@ -119,9 +164,13 @@ class DITENEnv:
         e_max = task_dag.e_max
         m_total = len(task_dag.subtasks)
         
-        r_delay_sub = 1.0 * ((t_max / m_total) - t_im)
-        r_delay_accm = 1.0 * (t_max - t_accm)
-        r_energy_sub = 1.0 * ((e_max / m_total) - e_im)
-        r_energy_accm = 1.0 * (e_max - e_accm)
+        # GIẢI PHÁP: Chỉnh sửa trọng số (lambdas)
+        l1, l2 = 0.5, 0.5  # Giảm trọng số của Delay xuống (ít thưởng cho việc xử lý nhanh hơn)
+        l3, l4 = 2, 2 # TĂNG MẠNH trọng số của Energy (phạt thật nặng nếu tốn năng lượng)
+        
+        r_delay_sub = l1 * ((t_max / m_total) - t_im)
+        r_delay_accm = l2 * (t_max - t_accm)
+        r_energy_sub = l3 * ((e_max / m_total) - e_im)
+        r_energy_accm = l4 * (e_max - e_accm)
         
         return r_delay_sub + r_delay_accm + r_energy_sub + r_energy_accm + p_out

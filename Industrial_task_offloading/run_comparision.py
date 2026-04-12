@@ -65,57 +65,69 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
 
     gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
     replay_buffer = MultiAgentReplayBuffer(capacity=100000)
+    TIME_SLOTS = 50 # Số lượng Time slot trong 1 Episode (T)
     batch_size = 64
     gamma = 0.99
     
     # Track metrics
-    history = {"reward": [], "delay": [], "energy": []}
+    history = {"reward": [], "delay": [], "energy": [], "local_ratio": [], "edge_ratio": []}
     
     for episode in range(num_episodes):
-        task_dags = generate_task_dags_for_episode(devices, data_loader)
-        
-        # 1. GCN Prioritization
-        priorities = {}
-        for device_id, task_dag in task_dags.items():
-            X, A = extract_gcn_inputs(task_dag)
-            with torch.no_grad():
-                scores = gcn_model(X, A)
-            sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
-            priorities[device_id] = [idx + 1 for idx in sorted_indices]
-            
-        # 2. Environment Stepping
-        current_joint_state = env.reset(task_dags, priorities) 
-        done = False
+        # task_dags = generate_task_dags_for_episode(devices, data_loader)
         episode_reward = 0
-        
-        while not done:
+        avg_delay_slots = []
+        avg_energy_slots = []
+        count_local = 0
+        count_edge = 0
+
+        for t in range(TIME_SLOTS):
             joint_actions = []
-            for i, agent in enumerate(agents):
-                agent_state = torch.FloatTensor(current_joint_state[i])
-                action = agent.select_action(agent_state)
-                joint_actions.append(action)
-                
-            next_joint_state, joint_rewards, done, _ = env.step(joint_actions)
-            episode_reward += sum(joint_rewards) / len(agents)
+            task_dags = generate_task_dags_for_episode(devices, data_loader)
+            priorities = {}
+            for device_id, task_dag in task_dags.items():
+                X, A = extract_gcn_inputs(task_dag)
+                with torch.no_grad():
+                    scores = gcn_model(X, A)
+                sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
+                priorities[device_id] = [idx + 1 for idx in sorted_indices]
+
+            current_joint_state = env.reset(task_dags, priorities) 
+            done = False
+            while not done:
+                joint_actions = []
+                for i, agent in enumerate(agents):
+                    agent_state = torch.FloatTensor(current_joint_state[i])
+                    action = agent.select_action(agent_state)
+                    joint_actions.append(action)
+
+                    if action == 0:
+                        count_local += 1
+                    else:
+                        count_edge += 1
+                    
+                next_joint_state, joint_rewards, done, _ = env.step(joint_actions)
+                episode_reward += sum(joint_rewards) / len(agents)
             
             replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
             current_joint_state = next_joint_state
         
         # 3. Extract Delay and Energy from environment at the end of the episode
-        avg_delay = np.mean(list(env.device_accumulated_delay.values()))
-        avg_energy = np.mean(list(env.device_accumulated_energy.values()))
+        avg_delay_slots.append(np.mean(list(env.device_accumulated_delay.values())))
+        avg_energy_slots.append(np.mean(list(env.device_accumulated_energy.values())))
         
-        history["reward"].append(episode_reward)
-        history["delay"].append(avg_delay)
-        history["energy"].append(avg_energy)
+        total_actions = count_local + count_edge
+        history["local_ratio"].append(count_local / total_actions * 100)
+        history["edge_ratio"].append(count_edge / total_actions * 100)
+
+        history["reward"].append(episode_reward / TIME_SLOTS) # Chia trung bình cho T
+        history["delay"].append(np.mean(avg_delay_slots))
+        history["energy"].append(np.mean(avg_energy_slots))
         
         # 4. Network Updates (Standard MADDPG logic)
         if len(replay_buffer) >= batch_size:
             state_b, action_b, reward_b, next_state_b = replay_buffer.sample(batch_size)
-            
-            
             for i, agent in enumerate(agents):
-                # --> NEW: If it's MAAC or MAPPO, let it handle its own update
+
                 action_dim = agent.action_dim
                 action_b_onehot = F.one_hot(action_b.long(), num_classes=action_dim).float()
                 if hasattr(agent, 'update_agent'):
@@ -153,9 +165,10 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
                 
                 if hasattr(agent, 'update_epsilon'):
                     agent.update_epsilon()
-
+    
         if (episode + 1) % 50 == 0:
-            print(f"Ep {episode + 1}/{num_episodes} | Reward: {episode_reward:.3f} | Delay: {avg_delay:.3f}s | Energy: {avg_energy:.3f}J")
+            print(f"Ep {episode + 1}/{num_episodes} | Avg Reward/Slot: {history['reward'][-1]:.3f} | Delay: {history['delay'][-1]:.3f}s | Energy: {history['energy'][-1]:.3f}J")
+            print(f"Local ({count_local} lần / {history['local_ratio'][-1]:.1f}%) - Edge ({count_edge} lần / {history['edge_ratio'][-1]:.1f}%)")
             
     return history
 

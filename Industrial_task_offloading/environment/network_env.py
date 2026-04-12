@@ -41,12 +41,18 @@ class NetworkEnvironment:
         f_deviation = f_actual - f_est
         
         # Estimated and actual execution delays
+        # Guard against division by zero if deviation is extremely large (optional but recommended)
+        # if f_est == f_deviation:
+        #     delta_t_loc = 0
+        # else:
+        #     delta_t_loc = cpu_cycles * f_deviation / (f_est * (f_est - f_deviation))
+
         t_est_loc = cpu_cycles / f_est
         delta_t_loc = cpu_cycles * f_deviation / (f_est * (f_est - f_deviation))
         t_actual_loc = t_est_loc + delta_t_loc
         
         # Energy consumption of local computation
-        e_local_comp = tau_i * cpu_cycles * (f_deviation ** 2)
+        e_local_comp = tau_i * cpu_cycles * (f_actual ** 2)
         
         return t_actual_loc, e_local_comp
 
@@ -65,6 +71,6 @@ class NetworkEnvironment:
         t_actual_edge = t_est_edge + delta_t_edge
         
         # Energy consumption of edge computation
-        e_edge_comp = tau_j * cpu_cycles * (f_deviation ** 2)
+        e_edge_comp = tau_j * cpu_cycles * (f_actual ** 2)
         
         return t_actual_edge, e_edge_comp
