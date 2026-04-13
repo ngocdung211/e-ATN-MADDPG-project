@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict
+from typing import List, Dict
 
 import numpy as np
 import torch
@@ -16,7 +16,6 @@ from models.maddpg import EpsilonATNMADDPGAgent
 from models.gcn import TaskPriorityGCN
 from dataset.data_loader import KolektorSDDLoader
 from ultils.plotter import DITENPlotter
-from ultils.plotter2 import DITENPlotter2
 
 import random
 
@@ -48,9 +47,19 @@ def generate_task_dags_for_episode(devices, data_loader: KolektorSDDLoader):
         task_dags[device.id] = task_dag
     return task_dags
 
-def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDevice], env: DITENEnv, replay_buffer: MultiAgentReplayBuffer, gcn_model : TaskPriorityGCN, data_loader: KolektorSDDLoader, num_episodes=2000, batch_size=64, gamma=0.99):
+def train_maddpg(
+    agents: List[EpsilonATNMADDPGAgent],
+    devices: List[IndustrialDevice],
+    env: DITENEnv,
+    replay_buffer: MultiAgentReplayBuffer,
+    gcn_model: TaskPriorityGCN,
+    data_loader: KolektorSDDLoader,
+    num_episodes=2000,
+    batch_size=64,
+    gamma=0.99,
+):
     num_agents = len(agents)
-    rewards_history = [] 
+    history = {"reward": [], "delay": [], "energy": []}
     
     for episode in range(num_episodes):
         # 1. Sinh task cho episode này
@@ -72,9 +81,6 @@ def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDe
         done = False
         episode_reward = 0
         
-        # Vòng lặp này giờ sẽ lặp đúng M lần (M = số lượng subtask = 5)
-        # time slot should change to miliseconds to better reflect the real-world scenario
-        # TODO: Modify time TIME_SLOTS
         while not done:
             joint_actions = []
             for i, agent in enumerate(agents):
@@ -120,11 +126,13 @@ def train_maddpg(agents:List[EpsilonATNMADDPGAgent], devices : List[IndustrialDe
                 agent.soft_update(agent.target_critic, agent.critic)
                 agent.update_epsilon()
 
-        rewards_history.append(episode_reward)
+        history["reward"].append(episode_reward)
+        history["delay"].append(np.mean(list(env.device_accumulated_delay.values())))
+        history["energy"].append(np.mean(list(env.device_accumulated_energy.values())))
         if (episode + 1) % 10 == 0:
             print(f"Episode {episode + 1}/{num_episodes} - Avg Reward: {episode_reward:.4f}")
             
-    return rewards_history
+    return history
 # ==========================================
 # ENTRY POINT: Khởi tạo và chạy mô phỏng
 # ==========================================
@@ -168,13 +176,10 @@ if __name__ == "__main__":
         devices.append(device)
         
     # 4. Khởi tạo DITEN Environment
-    # env = DITENEnv(devices, servers, network_env, time_slots=TIME_SLOTS)
-    # TODO: The env dont have time slot right now, need to add time slot
-    env = DITENEnv(devices, servers, network_env)
+    env = DITENEnv(devices, servers, network_env, slot_duration=1.0, subslot_count=100)
     # 5. Khởi tạo DRL Agents (\epsilon-ATN-MADDPG)
     # Xác định kích thước State và Action
-    # State của mỗi agent: f_loc (1) + w_d (1) + edge_f (3) + edge_w (3) = 8 features
-    STATE_DIM = 2 + NUM_SERVERS * 2
+    STATE_DIM = env.get_state_dim()
     # Action: 0 (Local) hoặc 1, 2, 3 (Các Server) -> 4 options
     ACTION_DIM = 1 + NUM_SERVERS
     
@@ -201,7 +206,7 @@ if __name__ == "__main__":
     print("\nStarting Training (e-ATN-MADDPG)...")
     EPISODES = 1000 # Theo bảng II
     
-    e_atn_rewards = train_maddpg(
+    e_atn_history = train_maddpg(
         agents=agents, 
         devices=devices,
         env=env, 
@@ -218,7 +223,7 @@ if __name__ == "__main__":
     
     # Tạo dictionary chứa dữ liệu để vẽ (Giả lập các đường baseline cho biểu đồ)
     data_to_plot = {
-        "e-ATN-MADDPG": e_atn_rewards
+        "e-ATN-MADDPG": e_atn_history["reward"]
     }
     date_string = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     plotter.plot_training_curve(
@@ -226,6 +231,18 @@ if __name__ == "__main__":
         title="Training Reward of e-ATN-MADDPG",
         ylabel="Average Reward",
         filename=f"training_reward_curve_{date_string}.png"
+    )
+    plotter.plot_training_curve(
+        data_dict={"e-ATN-MADDPG": e_atn_history["delay"]},
+        title="Training Delay of e-ATN-MADDPG",
+        ylabel="Average Delay",
+        filename=f"training_delay_curve_{date_string}.png"
+    )
+    plotter.plot_training_curve(
+        data_dict={"e-ATN-MADDPG": e_atn_history["energy"]},
+        title="Training Energy of e-ATN-MADDPG",
+        ylabel="Average Energy",
+        filename=f"training_energy_curve_{date_string}.png"
     )
     
     

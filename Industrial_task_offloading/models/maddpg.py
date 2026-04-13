@@ -44,11 +44,8 @@ class CriticNetwork(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, num_agents : int, hidden_dim: int = 64, use_attention: bool = True):
         super(CriticNetwork, self).__init__()
         feature_dim = state_dim + action_dim
-        
-        # Self-attention requires a sequence. We will treat the concatenated
-        # joint state and action as a sequence of length 1 for simplicity, 
-        # or you can split features if treating agents as sequence elements.
-        self.attention = SelfAttention(feature_dim=feature_dim, attention_dim=hidden_dim)
+        self.use_attention = use_attention
+        self.attention = SelfAttention(feature_dim=feature_dim, attention_dim=hidden_dim) if use_attention else None
         
         self.fc1 = nn.Linear(num_agents*feature_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -57,11 +54,9 @@ class CriticNetwork(nn.Module):
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         # Concatenate states and actions
         x = torch.cat([states, actions], dim=-1)
-        
-        # Apply self-attention (unsqueeze to add sequence dimension)
-        # x = x.unsqueeze(1)
-        x = self.attention(x)
-        # x = x.squeeze(1)
+
+        if self.use_attention:
+            x = self.attention(x)
         x = x.view(x.size(0), -1)
         
         x = F.relu(self.fc1(x))

@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 class Subtask:
     """
@@ -39,8 +39,16 @@ class IndustrialDevice:
     """
     Represents a mobile industrial device d_i.
     """
-    def __init__(self, device_id: int, location: np.ndarray, compute_power: float, 
-                 transmit_power: float, energy_coeff: float):
+    def __init__(
+        self,
+        device_id: int,
+        location: np.ndarray,
+        compute_power: float,
+        transmit_power: float,
+        energy_coeff: float,
+        speed_mps: float = 1.0,
+        direction: Optional[np.ndarray] = None,
+    ):
         self.id = device_id
         # Location L_i^t = [x, y]^T
         self.location = location
@@ -50,10 +58,25 @@ class IndustrialDevice:
         self.transmit_power = transmit_power
         # Energy coefficient for local computing \tau_i^{loc}
         self.energy_coeff = energy_coeff
+        # Mobility configuration
+        self.speed_mps = speed_mps
+        if direction is None:
+            direction = np.array([1.0, 0.0], dtype=float)
+        norm = np.linalg.norm(direction)
+        self.direction = direction / norm if norm > 0 else np.array([1.0, 0.0], dtype=float)
         
     def update_location(self, new_location: np.ndarray):
         """Updates the device's location based on the mobility model."""
         self.location = new_location
+
+    def set_direction(self, direction: np.ndarray):
+        norm = np.linalg.norm(direction)
+        if norm > 0:
+            self.direction = direction / norm
+
+    def project_location(self, duration_s: float) -> np.ndarray:
+        """Projects device location after moving with fixed speed and direction."""
+        return self.location + self.direction * self.speed_mps * duration_s
 
 class EdgeServer:
     """

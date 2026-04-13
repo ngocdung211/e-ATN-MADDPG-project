@@ -15,6 +15,7 @@ from models.maddpg import EpsilonATNMADDPGAgent
 from ultils.graph_ultils import extract_gcn_inputs
 from ultils.plotter import DITENPlotter
 from ultils.plotter2 import DITENPlotter2
+import time
 def set_seed(seed=42):
     """Ensure reproducibility across different algorithm runs."""
     np.random.seed(seed)
@@ -45,10 +46,10 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
     print(f"\n{'='*50}\nStarting Training for: {algo_name}\n{'='*50}")
     set_seed(42) # Reset seed for fair comparison
     
-    env = DITENEnv(devices, servers, network_env)
+    env = DITENEnv(devices, servers, network_env, slot_duration=1.0, subslot_count=100)
     
     # State/Action dimensions
-    STATE_DIM = 2 + len(servers) * 2
+    STATE_DIM = env.get_state_dim()
     ACTION_DIM = 1 + len(servers)
     # JOINT_STATE_DIM = STATE_DIM * len(devices)
     # JOINT_ACTION_DIM = len(devices)
@@ -65,7 +66,6 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
 
     gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
     replay_buffer = MultiAgentReplayBuffer(capacity=100000)
-    TIME_SLOTS = 50 # Số lượng Time slot trong 1 Episode (T)
     batch_size = 64
     gamma = 0.99
     
@@ -75,53 +75,44 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
     for episode in range(num_episodes):
         # task_dags = generate_task_dags_for_episode(devices, data_loader)
         episode_reward = 0
-        avg_delay_slots = []
-        avg_energy_slots = []
         count_local = 0
         count_edge = 0
 
-        for t in range(TIME_SLOTS):
+        task_dags = generate_task_dags_for_episode(devices, data_loader)
+        priorities = {}
+        for device_id, task_dag in task_dags.items():
+            X, A = extract_gcn_inputs(task_dag)
+            with torch.no_grad():
+                scores = gcn_model(X, A)
+            sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
+            priorities[device_id] = [idx + 1 for idx in sorted_indices]
+
+        current_joint_state = env.reset(task_dags, priorities)
+        done = False
+        while not done:
             joint_actions = []
-            task_dags = generate_task_dags_for_episode(devices, data_loader)
-            priorities = {}
-            for device_id, task_dag in task_dags.items():
-                X, A = extract_gcn_inputs(task_dag)
-                with torch.no_grad():
-                    scores = gcn_model(X, A)
-                sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
-                priorities[device_id] = [idx + 1 for idx in sorted_indices]
+            for i, agent in enumerate(agents):
+                agent_state = torch.FloatTensor(current_joint_state[i])
+                action = agent.select_action(agent_state)
+                joint_actions.append(action)
 
-            current_joint_state = env.reset(task_dags, priorities) 
-            done = False
-            while not done:
-                joint_actions = []
-                for i, agent in enumerate(agents):
-                    agent_state = torch.FloatTensor(current_joint_state[i])
-                    action = agent.select_action(agent_state)
-                    joint_actions.append(action)
+                if action == 0:
+                    count_local += 1
+                else:
+                    count_edge += 1
 
-                    if action == 0:
-                        count_local += 1
-                    else:
-                        count_edge += 1
-                    
-                next_joint_state, joint_rewards, done, _ = env.step(joint_actions)
-                episode_reward += sum(joint_rewards) / len(agents)
-            
+            next_joint_state, joint_rewards, done, _ = env.step(joint_actions)
+            # TODO: Dont have which agetn contribue to reward
+            episode_reward += sum(joint_rewards) / len(agents)
             replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
             current_joint_state = next_joint_state
-        
-        # 3. Extract Delay and Energy from environment at the end of the episode
-        avg_delay_slots.append(np.mean(list(env.device_accumulated_delay.values())))
-        avg_energy_slots.append(np.mean(list(env.device_accumulated_energy.values())))
         
         total_actions = count_local + count_edge
         history["local_ratio"].append(count_local / total_actions * 100)
         history["edge_ratio"].append(count_edge / total_actions * 100)
-
-        history["reward"].append(episode_reward / TIME_SLOTS) # Chia trung bình cho T
-        history["delay"].append(np.mean(avg_delay_slots))
-        history["energy"].append(np.mean(avg_energy_slots))
+        history["reward"].append(episode_reward)
+        history["delay"].append(np.mean(list(env.device_accumulated_delay.values())))
+        history["energy"].append(np.mean(list(env.device_accumulated_energy.values())))
         
         # 4. Network Updates (Standard MADDPG logic)
         if len(replay_buffer) >= batch_size:
@@ -196,10 +187,10 @@ if __name__ == "__main__":
 
     # 2. Define Algorithms to Compare
     algorithms = {
-        # "MADDPG": {
-        #     "class": EpsilonATNMADDPGAgent, 
-        #     "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001}
-        # },
+        "MADDPG": {
+            "class": EpsilonATNMADDPGAgent, 
+            "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001}
+        },
         "GR-MADDPG": {
             "class": EpsilonATNMADDPGAgent, 
             "kwargs": {"use_attention": False, "use_epsilon_greedy": True, "lr": 0.0001}
@@ -208,14 +199,15 @@ if __name__ == "__main__":
             "class": EpsilonATNMADDPGAgent, 
             "kwargs": {"use_attention": True, "use_epsilon_greedy": False, "lr": 0.0001}
         },
+
+        # Uncomment when implemented:
+        "MAAC": {"class": MAACAgent, "kwargs": {"lr": 0.0001}},
+
+        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": 0.0001}},
         "e-ATN-MADDPG": {
             "class": EpsilonATNMADDPGAgent,
             "kwargs": {"use_attention": True, "use_epsilon_greedy": True, "lr": 0.0001}
-        }
-        # Uncomment when implemented:
-        # "MAAC": {"class": MAACAgent, "kwargs": {"lr": 0.0001}},
-
-        # "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": 0.0001}}
+        },
     }
 
     # 3. Run Comparisons
@@ -233,11 +225,12 @@ if __name__ == "__main__":
     plotter = DITENPlotter2()
     
     # Plot Reward (Like Fig. 8)
+    date_string = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     plotter.plot_training_curve(
         data_dict=results["reward"], 
         title="Performance Comparison in Reward", 
         ylabel="Reward", 
-        filename="comparison_reward.png"
+        filename=f"{date_string}_comparison_reward.png"
     )
     
     # Plot Delay (Like Fig. 9)
@@ -245,7 +238,7 @@ if __name__ == "__main__":
         data_dict=results["delay"], 
         title="Performance Comparison in Task Processing Delay", 
         ylabel="Task Processing Delay (s)", 
-        filename="comparison_delay.png"
+        filename=f"{date_string}_comparison_delay.png"
     )
     
     # Plot Energy (Like Fig. 10)
@@ -253,7 +246,7 @@ if __name__ == "__main__":
         data_dict=results["energy"], 
         title="Performance Comparison in Energy Consumption", 
         ylabel="Energy Consumption (J)", 
-        filename="comparison_energy.png"
+        filename=f"{date_string}_comparison_energy.png"
     )
     
     print("Plots saved successfully! Check your directory.")
