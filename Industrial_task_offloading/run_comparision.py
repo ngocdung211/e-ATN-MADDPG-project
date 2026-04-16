@@ -1,52 +1,214 @@
+"""Run training comparisons across e-ATN-MADDPG and baselines.
+
+This script trains multiple algorithms on the DITEN environment and
+generates plots and JSON summaries for reward, delay, and energy.
+"""
+
+from typing import Dict, List, Sequence, Tuple
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 import random
+import json
+import os
+from tqdm import trange
 from baselines.maac import MAACAgent
 from baselines.mappo import MAPPOAgent
+from baselines.scheduling_baselines import BaselineSchedulers
 # Environment & Models
 from environment.network_env import NetworkEnvironment
-from environment.system_model import IndustrialDevice, EdgeServer, TaskDAG, Subtask
+from environment.system_model import EdgeServer, IndustrialDevice, TaskDAG
 from environment.diten_env import DITENEnv
 from dataset.data_loader import KolektorSDDLoader
 from models.replay_buffer import MultiAgentReplayBuffer
 from models.gcn import TaskPriorityGCN
 from models.maddpg import EpsilonATNMADDPGAgent
-from ultils.graph_ultils import extract_gcn_inputs
 from ultils.plotter import DITENPlotter
 from ultils.plotter2 import DITENPlotter2
+from ultils.gcn_training import load_or_train_gcn
+from ultils.experiment_setup import build_priorities, generate_task_dags_for_episode, make_gcn_dag_sampler
 import time
-def set_seed(seed=42):
-    """Ensure reproducibility across different algorithm runs."""
+
+
+def set_seed(seed: int = 42) -> None:
+    """Set random seeds for reproducible runs.
+
+    Args:
+        seed: Random seed value.
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
 
-def generate_task_dags_for_episode(devices, data_loader):
-    task_dags = {}
-    for device in devices:
-        task_params = data_loader.get_random_task_parameters()
-        task_dag = TaskDAG(task_id=device.id, t_max=1.0, e_max=1.0) # e_max corrected to 1.0 J
-        
-        for i in range(1, 6):
-            params = task_params[f"subtask_{i}"]
-            task_dag.add_subtask(Subtask(i, params["cpu_cycles"], params["data_size"], params["result_size"]))
-            
-        task_dag.add_dependency(1, 2)
-        task_dag.add_dependency(1, 3)
-        task_dag.add_dependency(2, 4)
-        task_dag.add_dependency(3, 4)
-        task_dag.add_dependency(4, 5)
-        
-        task_dags[device.id] = task_dag
-    return task_dags
 
-def train_algorithm(algo_name, agent_config, devices, servers, network_env, data_loader, num_episodes=1000):
-    """Trains a specific algorithm and returns histories for Reward, Delay, and Energy."""
+def build_priorities_by_mode(
+    task_dags: Dict[int, TaskDAG],
+    gcn_model: TaskPriorityGCN,
+    mode: str = "gcn",
+) -> Dict[int, List[int]]:
+    """Build per-device subtask priorities based on the selected mode.
+
+    Args:
+        task_dags: Mapping of device IDs to TaskDAGs.
+        gcn_model: TaskPriorityGCN used to infer priorities.
+        mode: Scheduling mode ("gcn", "random", "greedy").
+
+    Returns:
+        Mapping of device IDs to ordered subtask IDs.
+    """
+    priorities = {}
+    for device_id, task_dag in task_dags.items():
+        if mode == "random":
+            priorities[device_id] = BaselineSchedulers.random_scheduling(task_dag)
+        elif mode == "greedy":
+            priorities[device_id] = BaselineSchedulers.greedy_scheduling(task_dag)
+        else:
+            priorities[device_id] = build_priorities({device_id: task_dag}, gcn_model)[device_id]
+    return priorities
+
+
+def _collect_joint_actions(
+    agents: Sequence[object], joint_state: np.ndarray
+) -> Tuple[List[int], int, int]:
+    """Select joint actions and count local/edge choices.
+
+    Args:
+        agents: Agents selecting actions.
+        joint_state: Joint state array shaped (num_agents, state_dim).
+
+    Returns:
+        Tuple of (joint_actions, local_count, edge_count).
+    """
+    joint_actions: List[int] = []
+    local_count = 0
+    edge_count = 0
+    for agent_index, agent in enumerate(agents):
+        agent_state = torch.FloatTensor(joint_state[agent_index])
+        action = agent.select_action(agent_state)
+        joint_actions.append(action)
+        if action == 0:
+            local_count += 1
+        else:
+            edge_count += 1
+    return joint_actions, local_count, edge_count
+
+
+def _update_agents_from_buffer(
+    agents: Sequence[object],
+    replay_buffer: MultiAgentReplayBuffer,
+    batch_size: int,
+    gamma: float,
+) -> None:
+    """Update agents from replay buffer samples when available.
+
+    Args:
+        agents: Agents to update.
+        replay_buffer: Shared replay buffer.
+        batch_size: Batch size for sampling.
+        gamma: Discount factor.
+    """
+    if len(replay_buffer) < batch_size:
+        return
+
+    state_b, action_b, reward_b, next_state_b = replay_buffer.sample(batch_size)
+    for agent_index, agent in enumerate(agents):
+        action_dim = agent.action_dim
+        action_b_onehot = F.one_hot(action_b.long(), num_classes=action_dim).float()
+        if hasattr(agent, "update_agent"):
+            agent.update_agent(state_b, action_b, reward_b, next_state_b, agent_index=agent_index)
+            if hasattr(agent, "update_epsilon"):
+                agent.update_epsilon()
+            continue
+
+        if hasattr(agent, "target_actor"):
+            agent_rewards = reward_b[:, agent_index].unsqueeze(1)
+            with torch.no_grad():
+                target_joint_action_idx = torch.stack(
+                    [
+                        torch.argmax(a.target_actor(next_state_b[:, j, :]), dim=1)
+                        for j, a in enumerate(agents)
+                    ],
+                    dim=1,
+                )
+                target_joint_actions = F.one_hot(
+                    target_joint_action_idx.long(), num_classes=action_dim
+                ).float()
+                target_q = agent.target_critic(next_state_b, target_joint_actions)
+                y_i = agent_rewards + gamma * target_q
+
+            current_q = agent.critic(state_b, action_b_onehot)
+            critic_loss = F.mse_loss(current_q, y_i)
+            agent.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            agent.critic_optimizer.step()
+
+            predicted_action_idx = torch.argmax(agent.actor(state_b[:, agent_index, :]), dim=1)
+            predicted_actions = F.one_hot(
+                predicted_action_idx.long(), num_classes=action_dim
+            ).float()
+            predicted_joint_actions = action_b_onehot.clone()
+            predicted_joint_actions[:, agent_index] = predicted_actions
+
+            actor_loss = -agent.critic(state_b, predicted_joint_actions).mean()
+            agent.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            agent.actor_optimizer.step()
+
+            agent.soft_update(agent.target_actor, agent.actor)
+            agent.soft_update(agent.target_critic, agent.critic)
+
+        if hasattr(agent, "update_epsilon"):
+            agent.update_epsilon()
+
+
+def train_algorithm(
+    algo_name: str,
+    agent_config: Dict[str, object],
+    devices: Sequence[IndustrialDevice],
+    servers: Sequence[EdgeServer],
+    network_env: NetworkEnvironment,
+    data_loader: KolektorSDDLoader,
+    gcn_model: TaskPriorityGCN,
+    num_episodes: int = 100,
+    priority_mode: str = "gcn",
+) -> Dict[str, List[float]]:
+    """Train one algorithm configuration and return metric histories.
+
+    Args:
+        algo_name: Display name for logging.
+        agent_config: Dict with "class" and optional "kwargs" for agent init.
+        devices: List of IndustrialDevice instances.
+        servers: List of EdgeServer instances.
+        network_env: NetworkEnvironment instance.
+        data_loader: Dataset loader for DAG generation.
+        gcn_model: TaskPriorityGCN used for priority extraction.
+        num_episodes: Number of episodes to train.
+        priority_mode: Scheduling mode ("gcn", "random", "greedy").
+
+    Returns:
+        Dict with reward, delay, energy, local_ratio, and edge_ratio histories.
+    """
     print(f"\n{'='*50}\nStarting Training for: {algo_name}\n{'='*50}")
-    set_seed(42) # Reset seed for fair comparison
+    set_seed(42)  # Reset seed for fair comparison
     
-    env = DITENEnv(devices, servers, network_env, slot_duration=1.0, subslot_count=100)
+    time_slots = 50
+    env = DITENEnv(
+        devices,
+        servers,
+        network_env,
+        slot_duration=1.0,
+        subslot_count=200,
+        time_slots=time_slots,
+        lambda1=2,
+        lambda2=1,
+        lambda3=2,
+        lambda4=1,
+        lambda5=1,
+        p_out_value=-4,
+        local_estimation_error=0.2,
+        edge_estimation_error=0.1,
+    )
     
     # State/Action dimensions
     STATE_DIM = env.get_state_dim()
@@ -55,7 +217,7 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
     # JOINT_ACTION_DIM = len(devices)
     
     # Initialize Agents dynamically based on the config
-    agents = []
+    agents: List[object] = []
     for _ in range(len(devices)):
         agent = agent_config["class"](
             state_dim=STATE_DIM, action_dim=ACTION_DIM, 
@@ -64,102 +226,98 @@ def train_algorithm(algo_name, agent_config, devices, servers, network_env, data
         )
         agents.append(agent)
 
-    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
     replay_buffer = MultiAgentReplayBuffer(capacity=100000)
     batch_size = 64
     gamma = 0.99
     
     # Track metrics
     history = {"reward": [], "delay": [], "energy": [], "local_ratio": [], "edge_ratio": []}
-    
-    for episode in range(num_episodes):
-        # task_dags = generate_task_dags_for_episode(devices, data_loader)
-        episode_reward = 0
+
+    episode_iterator = trange(num_episodes, desc=f"Training {algo_name}", leave=True)
+    for episode in episode_iterator:
+        env.reset_episode()
         count_local = 0
         count_edge = 0
+        slot_rewards = []
+        slot_delays = []
+        slot_energies = []
 
-        task_dags = generate_task_dags_for_episode(devices, data_loader)
-        priorities = {}
-        for device_id, task_dag in task_dags.items():
-            X, A = extract_gcn_inputs(task_dag)
-            with torch.no_grad():
-                scores = gcn_model(X, A)
-            sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
-            priorities[device_id] = [idx + 1 for idx in sorted_indices]
-
-        current_joint_state = env.reset(task_dags, priorities)
         done = False
-        while not done:
-            joint_actions = []
-            for i, agent in enumerate(agents):
-                agent_state = torch.FloatTensor(current_joint_state[i])
-                action = agent.select_action(agent_state)
-                joint_actions.append(action)
+        for _ in range(time_slots):
+            slot_reward = 0.0
+            slot_local = 0
+            slot_edge = 0
+            slot_steps = 0
+            prev_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
+            prev_energy_mean = np.mean(list(env.device_accumulated_energy.values()))
+            task_dags = generate_task_dags_for_episode(devices, data_loader)
+            priorities = build_priorities_by_mode(task_dags, gcn_model, priority_mode)
 
-                if action == 0:
-                    count_local += 1
-                else:
-                    count_edge += 1
+            current_joint_state = env.start_time_slot(task_dags, priorities)
+            slot_done = False
+            while not slot_done and not done:
+                joint_actions, local_count, edge_count = _collect_joint_actions(
+                    agents, current_joint_state
+                )
+                count_local += local_count
+                count_edge += edge_count
+                slot_local += local_count
+                slot_edge += edge_count
 
-            next_joint_state, joint_rewards, done, _ = env.step(joint_actions)
-            # TODO: Dont have which agetn contribue to reward
-            episode_reward += sum(joint_rewards) / len(agents)
-            replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
-            current_joint_state = next_joint_state
+                next_joint_state, joint_rewards, done, info = env.step(joint_actions)
+                slot_done = info.get("slot_done", False)
+                # Aggregate team reward as average per-agent immediate reward.
+                step_reward = sum(joint_rewards) / len(agents)
+                slot_reward += step_reward
+                slot_steps += 1
+                replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
+                current_joint_state = next_joint_state
         
+            total_slot_actions = slot_local + slot_edge
+            if total_slot_actions == 0:
+                history["local_ratio"].append(0.0)
+                history["edge_ratio"].append(0.0)
+            else:
+                history["local_ratio"].append(slot_local / total_slot_actions * 100)
+                history["edge_ratio"].append(slot_edge / total_slot_actions * 100)
+
+            current_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
+            current_energy_mean = np.mean(list(env.device_accumulated_energy.values()))
+            slot_rewards.append(slot_reward / max(slot_steps, 1))
+            slot_delays.append(max(0.0, current_delay_mean - prev_delay_mean))
+            slot_energies.append(max(0.0, current_energy_mean - prev_energy_mean))
+
+        episode_avg_reward = float(np.mean(slot_rewards)) if slot_rewards else 0.0
+        episode_avg_delay = float(np.mean(slot_delays)) if slot_delays else 0.0
+        episode_avg_energy = float(np.mean(slot_energies)) if slot_energies else 0.0
         total_actions = count_local + count_edge
-        history["local_ratio"].append(count_local / total_actions * 100)
-        history["edge_ratio"].append(count_edge / total_actions * 100)
-        history["reward"].append(episode_reward)
-        history["delay"].append(np.mean(list(env.device_accumulated_delay.values())))
-        history["energy"].append(np.mean(list(env.device_accumulated_energy.values())))
-        
+        local_ratio = (count_local / total_actions * 100.0) if total_actions > 0 else 0.0
+        edge_ratio = (count_edge / total_actions * 100.0) if total_actions > 0 else 0.0
+
+        history["reward"].append(episode_avg_reward)
+        history["delay"].append(episode_avg_delay)
+        history["energy"].append(episode_avg_energy)
+        history["local_ratio"].append(local_ratio)
+        history["edge_ratio"].append(edge_ratio)
+
+        episode_iterator.set_postfix(
+            reward=f"{episode_avg_reward:.3f}",
+            delay=f"{episode_avg_delay:.3f}s",
+            energy=f"{episode_avg_energy:.3f}J",
+        )
+         
         # 4. Network Updates (Standard MADDPG logic)
-        if len(replay_buffer) >= batch_size:
-            state_b, action_b, reward_b, next_state_b = replay_buffer.sample(batch_size)
-            for i, agent in enumerate(agents):
-
-                action_dim = agent.action_dim
-                action_b_onehot = F.one_hot(action_b.long(), num_classes=action_dim).float()
-                if hasattr(agent, 'update_agent'):
-                    agent.update_agent(state_b, action_b, reward_b, next_state_b, agent_index=i)
-                    
-                # --> EXISTING: Fallback to MADDPG logic
-                elif hasattr(agent, 'target_actor'):
-                    agent_rewards = reward_b[:, i].unsqueeze(1)
-                    with torch.no_grad():
-                        target_joint_actions = torch.stack([a.target_actor(next_state_b[:, j, :]) for j, a in enumerate(agents)], dim=1)
-                        target_q = agent.target_critic(next_state_b, target_joint_actions)
-                        y_i = agent_rewards + gamma * target_q
-                        
-                    current_q = agent.critic(state_b, action_b_onehot)
-                    critic_loss = F.mse_loss(current_q, y_i)
-                    agent.critic_optimizer.zero_grad()
-                    critic_loss.backward()
-                    agent.critic_optimizer.step()
-                    
-                    # predicted_actions = agent.actor(state_b[:, i, :])
-                    # predicted_joint_actions = action_b.clone()
-                    # predicted_joint_actions[:, i] = predicted_actions.argmax(dim=1).float()
-                    
-                    predicted_actions = agent.actor(state_b[:, i, :])
-                    predicted_joint_actions = action_b_onehot.clone()
-                    predicted_joint_actions[:, i] = predicted_actions
-
-                    actor_loss = -agent.critic(state_b, predicted_joint_actions).mean()
-                    agent.actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    agent.actor_optimizer.step()
-                    
-                    agent.soft_update(agent.target_actor, agent.actor)
-                    agent.soft_update(agent.target_critic, agent.critic)
-                
-                if hasattr(agent, 'update_epsilon'):
-                    agent.update_epsilon()
+        _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
     
         if (episode + 1) % 50 == 0:
-            print(f"Ep {episode + 1}/{num_episodes} | Avg Reward/Slot: {history['reward'][-1]:.3f} | Delay: {history['delay'][-1]:.3f}s | Energy: {history['energy'][-1]:.3f}J")
-            print(f"Local ({count_local} lần / {history['local_ratio'][-1]:.1f}%) - Edge ({count_edge} lần / {history['edge_ratio'][-1]:.1f}%)")
+            print(
+                f"[{algo_name}] Ep {episode + 1}/{num_episodes} ----|--- Avg R/Slot: {history['reward'][-1]:.3f} "
+                f"---|--- D: {history['delay'][-1]:.3f}s ---|--- E: {history['energy'][-1]:.3f}J"
+            )
+            print(
+                f"[{algo_name}] Local ({count_local} / {history['local_ratio'][-1]:.1f}%) - "
+                f"Edge ({count_edge} / {history['edge_ratio'][-1]:.1f}%)"
+            )
             
     return history
 
@@ -170,52 +328,108 @@ if __name__ == "__main__":
     
     network_env = NetworkEnvironment(bandwidth=BANDWIDTH, noise_power_dbm=NOISE_POWER)
     data_loader = KolektorSDDLoader(dataset_path="dataset/KolektorSDD/")
+    dataset_stats = data_loader.get_dataset_statistics()
+    print(
+        f"Dataset images found: {dataset_stats['total_images']} "
+        f"(paper: 399; aligned={dataset_stats['is_paper_count_aligned']})"
+    )
+
+    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
+    gcn_ckpt_path = "models/checkpoints/gcn_priority.pt"
+    sample_training_dag = make_gcn_dag_sampler(data_loader)
+
+    gcn_model = load_or_train_gcn(
+        gcn_model=gcn_model,
+        dag_sampler=sample_training_dag,
+        checkpoint_path=gcn_ckpt_path,
+        epochs=200,
+        samples_per_epoch=32,
+        lr=0.01,
+    )
     
-    # Fixed Edge Servers (Based on Paper Topology Fig 4)
-    server_locations = [np.array([20.0, 30.0]), np.array([50.0, 45.0]), np.array([70.0, 20.0])]
+    # Fixed Edge Servers (User-confirmed Fig.4 topology)
+    server_locations = [np.array([20.0, 30.0]), np.array([45.0, 50.0]), np.array([70.0, 20.0])]
     servers = [
         EdgeServer(j+1, loc, np.random.uniform(2.3, 2.5)*1e9, 1.2, 1e-27, coverage_radius=12.0)
         for j, loc in enumerate(server_locations)
     ]
 
-    # Fixed starting locations for devices
+    # 10 devices: each pair shares one fixed rectangular route (starting at first waypoint)
+    robot_starts = [
+        np.array([10.0, 10.0]), np.array([30.0, 30.0]),
+        np.array([70.0, 10.0]), np.array([40.0, 20.0]),
+        np.array([40.0, 20.0]), np.array([60.0, 50.0]),
+        np.array([70.0, 10.0]), np.array([90.0, 40.0]),
+        np.array([65.0, 45.0]), np.array([90.0, 55.0]),
+    ]
     devices = [
-        IndustrialDevice(i+1, np.array([np.random.uniform(0, 100), np.random.uniform(0, 100)]), 
-                         np.random.uniform(0.8, 1.2)*1e9, 0.5, 1e-28)
+        IndustrialDevice(i+1, robot_starts[i], np.random.uniform(0.8, 1.2)*1e9, 0.5, 1e-28)
         for i in range(NUM_DEVICES)
     ]
 
     # 2. Define Algorithms to Compare
     algorithms = {
-        "MADDPG": {
-            "class": EpsilonATNMADDPGAgent, 
-            "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001}
-        },
-        "GR-MADDPG": {
-            "class": EpsilonATNMADDPGAgent, 
-            "kwargs": {"use_attention": False, "use_epsilon_greedy": True, "lr": 0.0001}
-        },
-        "ATN-MADDPG": {
-            "class": EpsilonATNMADDPGAgent, 
-            "kwargs": {"use_attention": True, "use_epsilon_greedy": False, "lr": 0.0001}
-        },
-
-        # Uncomment when implemented:
-        "MAAC": {"class": MAACAgent, "kwargs": {"lr": 0.0001}},
-
-        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": 0.0001}},
         "e-ATN-MADDPG": {
             "class": EpsilonATNMADDPGAgent,
-            "kwargs": {"use_attention": True, "use_epsilon_greedy": True, "lr": 0.0001}
+            "kwargs": {"use_attention": True, "use_epsilon_greedy": True, "lr": 0.0001},
         },
+        "MAAC": {"class": MAACAgent, "kwargs": {"lr": 0.0001}},
+        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": 0.0001}},
+        "MADDPG": {
+            "class": EpsilonATNMADDPGAgent,
+            "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001},
+        },
+        "GR-MADDPG": {
+            "class": EpsilonATNMADDPGAgent,
+            "kwargs": {"use_attention": False, "use_epsilon_greedy": True, "lr": 0.0001},
+        },
+        "ATN-MADDPG": {
+            "class": EpsilonATNMADDPGAgent,
+            "kwargs": {"use_attention": True, "use_epsilon_greedy": False, "lr": 0.0001},
+        },
+ 
     }
 
     # 3. Run Comparisons
     results = {"reward": {}, "delay": {}, "energy": {}}
-    EPISODES = 1000 # Use a smaller number (e.g., 100) for testing
-    
+    priority_results = {"reward": {}, "delay": {}, "energy": {}}
+    EPISODES = 100 # Use a smaller number (e.g., 100) for testing
+
+    # Fig.6-style priority extraction comparison under fixed e-ATN-MADDPG.
+    priority_modes = {"Random Scheduling": "random", "Greedy Scheduling": "greedy", "GCN Scheduling": "gcn"}
+    # priority_modes = {"GCN Scheduling": "gcn"}
+    e_atn_cfg = {
+        "class": EpsilonATNMADDPGAgent,
+        "kwargs": {"use_attention": True, "use_epsilon_greedy": True, "lr": 0.0001},
+    }
+    # for label, mode in priority_modes.items():
+    #     history = train_algorithm(
+    #         f"e-ATN-MADDPG ({label})",
+    #         e_atn_cfg,
+    #         devices,
+    #         servers,
+    #         network_env,
+    #         data_loader,
+    #         gcn_model=gcn_model,
+    #         num_episodes=EPISODES,
+    #         priority_mode=mode,
+    #     )
+    #     priority_results["reward"][label] = history["reward"]
+    #     priority_results["delay"][label] = history["delay"]
+    #     priority_results["energy"][label] = history["energy"]
+
     for algo_name, config in algorithms.items():
-        history = train_algorithm(algo_name, config, devices, servers, network_env, data_loader, num_episodes=EPISODES)
+        history = train_algorithm(
+            algo_name,
+            config,
+            devices,
+            servers,
+            network_env,
+            data_loader,
+            num_episodes=EPISODES,
+            gcn_model=gcn_model,
+            priority_mode="gcn",
+        )
         results["reward"][algo_name] = history["reward"]
         results["delay"][algo_name] = history["delay"]
         results["energy"][algo_name] = history["energy"]
@@ -248,5 +462,30 @@ if __name__ == "__main__":
         ylabel="Energy Consumption (J)", 
         filename=f"{date_string}_comparison_energy.png"
     )
+
+    # plotter.plot_training_curve(
+    #     data_dict=priority_results["reward"],
+    #     title="Rewards of Different Execution Priority Extracting Algorithms",
+    #     ylabel="Reward",
+    #     filename=f"{date_string}_priority_comparison_reward.png",
+    # )
+
+    os.makedirs("plots", exist_ok=True)
+    results_path = os.path.join("plots", f"{date_string}_comparison_results.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "metadata": {
+                    "episodes": EPISODES,
+                    "dataset_total_images": dataset_stats["total_images"],
+                    "dataset_paper_expected_images": 399,
+                    "dataset_paper_count_aligned": dataset_stats["is_paper_count_aligned"],
+                },
+                "algorithm_results": results,
+                "priority_results": priority_results,
+            },
+            f,
+            indent=2,
+        )
     
-    print("Plots saved successfully! Check your directory.")
+    print(f"Plots and results saved successfully! JSON: {results_path}")

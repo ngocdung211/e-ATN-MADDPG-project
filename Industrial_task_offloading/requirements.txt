@@ -4,3 +4,4 @@ Pillow>=8.4.0
 # Plotting and Visualization
 matplotlib>=3.4.3
 seaborn>=0.11.2
+tqdm>=4.66.0

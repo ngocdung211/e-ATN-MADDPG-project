@@ -1,0 +1,100 @@
+"""Helper functions to build DAGs and GCN priorities."""
+
+from __future__ import annotations
+
+from typing import Callable, Dict, List
+
+import torch
+
+from dataset.data_loader import KolektorSDDLoader
+from environment.system_model import IndustrialDevice, Subtask, TaskDAG
+from ultils.graph_ultils import extract_gcn_inputs
+
+
+DEFAULT_DAG_EDGES = [(1, 2), (1, 3), (2, 4), (3, 4), (4, 5)]
+
+
+def build_task_dag(
+    task_id: int, task_params: Dict[str, Dict[str, float]], t_max: float = 1.0, e_max: float = 1.0
+) -> TaskDAG:
+    """Build a TaskDAG from task parameters.
+
+    Args:
+        task_id: Unique task identifier.
+        task_params: Subtask parameter mapping.
+        t_max: Maximum tolerable delay.
+        e_max: Maximum tolerable energy.
+
+    Returns:
+        Constructed TaskDAG instance.
+    """
+    task_dag = TaskDAG(task_id=task_id, t_max=t_max, e_max=e_max)
+    for subtask_id in range(1, 6):
+        params = task_params[f"subtask_{subtask_id}"]
+        task_dag.add_subtask(
+            Subtask(subtask_id, params["cpu_cycles"], params["data_size"], params["result_size"])
+        )
+    for pred, succ in DEFAULT_DAG_EDGES:
+        task_dag.add_dependency(pred, succ)
+    return task_dag
+
+
+def generate_task_dags_for_episode(
+    devices: List[IndustrialDevice], data_loader: KolektorSDDLoader, t_max: float = 1.0, e_max: float = 1.0
+) -> Dict[int, TaskDAG]:
+    """Generate a TaskDAG per device for a single episode.
+
+    Args:
+        devices: Devices participating in the episode.
+        data_loader: Dataset loader for random task parameters.
+        t_max: Maximum tolerable delay.
+        e_max: Maximum tolerable energy.
+
+    Returns:
+        Mapping of device IDs to TaskDAGs.
+    """
+    task_dags: Dict[int, TaskDAG] = {}
+    for device in devices:
+        task_params = data_loader.get_random_task_parameters()
+        task_dags[device.id] = build_task_dag(device.id, task_params, t_max=t_max, e_max=e_max)
+    return task_dags
+
+
+def build_priorities(task_dags: Dict[int, TaskDAG], gcn_model: torch.nn.Module) -> Dict[int, List[int]]:
+    """Build execution priorities per device using the GCN model.
+
+    Args:
+        task_dags: Task DAGs keyed by device ID.
+        gcn_model: Trained GCN model.
+
+    Returns:
+        Mapping of device IDs to priority-ordered subtask IDs.
+    """
+    priorities: Dict[int, List[int]] = {}
+    for device_id, task_dag in task_dags.items():
+        features, adjacency = extract_gcn_inputs(task_dag)
+        with torch.no_grad():
+            scores = gcn_model(features, adjacency)
+        sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
+        priorities[device_id] = [idx + 1 for idx in sorted_indices]
+    return priorities
+
+
+def make_gcn_dag_sampler(
+    data_loader: KolektorSDDLoader, t_max: float = 1.0, e_max: float = 1.0
+) -> Callable[[], TaskDAG]:
+    """Create a callable that samples TaskDAGs for GCN training.
+
+    Args:
+        data_loader: Dataset loader for random task parameters.
+        t_max: Maximum tolerable delay.
+        e_max: Maximum tolerable energy.
+
+    Returns:
+        Callable that returns a TaskDAG.
+    """
+    def _sampler() -> TaskDAG:
+        task_params = data_loader.get_random_task_parameters()
+        return build_task_dag(task_id=0, task_params=task_params, t_max=t_max, e_max=e_max)
+
+    return _sampler

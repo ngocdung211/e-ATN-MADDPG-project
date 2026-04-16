@@ -1,18 +1,22 @@
+"""Baseline scheduling heuristics."""
+
 import random
-from typing import List, Dict
-# Assuming we import our previously defined TaskDAG and Subtask classes
-# from environment.system_models import TaskDAG, Subtask
+from typing import Dict, List
+
+from environment.system_model import TaskDAG
 
 class BaselineSchedulers:
-    """
-    Implements the baseline scheduling algorithms to compare against the GCN.
-    """
+    """Implement baseline scheduling algorithms to compare against the GCN."""
     
     @staticmethod
-    def random_scheduling(task_dag) -> List[int]:
-        """
-        Random Scheduling: Completely ignores dependencies and randomly 
-        shuffles the subtasks to generate an execution priority.
+    def random_scheduling(task_dag: TaskDAG) -> List[int]:
+        """Generate a random subtask execution order.
+
+        Args:
+            task_dag: Task DAG containing subtasks.
+
+        Returns:
+            Randomized list of subtask IDs.
         """
         # Extract all subtask IDs from the DAG
         subtask_ids = list(task_dag.subtasks.keys())
@@ -23,13 +27,17 @@ class BaselineSchedulers:
         return subtask_ids
 
     @staticmethod
-    def greedy_scheduling(task_dag) -> List[int]:
-        """
-        Greedy Scheduling: Prioritizes the subtask with the highest 
-        cumulative computation volume of its successor subtasks.
+    def greedy_scheduling(task_dag: TaskDAG) -> List[int]:
+        """Prioritize subtasks by successor computation volume.
+
+        Args:
+            task_dag: Task DAG containing subtasks and dependencies.
+
+        Returns:
+            List of subtask IDs ordered by descending successor computation.
         """
         subtask_ids = list(task_dag.subtasks.keys())
-        cumulative_computations = {}
+        cumulative_computations: Dict[int, float] = {}
         
         # Helper function to recursively calculate computation volume of successors
         def get_successor_computation(current_id: int) -> float:
@@ -49,15 +57,15 @@ class BaselineSchedulers:
             return total_volume
 
         # Calculate the cumulative successor computation for each subtask
-        for s_id in subtask_ids:
-            cumulative_computations[s_id] = get_successor_computation(s_id)
+        for subtask_id in subtask_ids:
+            cumulative_computations[subtask_id] = get_successor_computation(subtask_id)
             
         # Sort subtask IDs based on the calculated volume in descending order
         # Subtasks with the largest successor computation volume get highest priority
         greedy_priority = sorted(
-            subtask_ids, 
-            key=lambda x: cumulative_computations[x], 
-            reverse=True
+            subtask_ids,
+            key=lambda subtask_id: cumulative_computations[subtask_id],
+            reverse=True,
         )
         
         return greedy_priority

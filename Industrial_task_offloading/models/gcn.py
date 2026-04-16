@@ -1,53 +1,81 @@
+"""Graph convolutional network for task priority prediction."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-def normalize_adjacency(A: torch.Tensor) -> torch.Tensor:
-    """
-    Computes D^{-1/2} * (A + I) * D^{-1/2} as defined in the paper.
+def normalize_adjacency(adjacency: torch.Tensor) -> torch.Tensor:
+    """Compute D^{-1/2} (A + I) D^{-1/2} normalization.
+
+    Args:
+        adjacency: Adjacency matrix A.
+
+    Returns:
+        Normalized adjacency matrix.
     """
     # Add identity matrix to adjacency matrix (A + I)
-    I = torch.eye(A.size(0), device=A.device)
-    A_hat = A + I
+    identity = torch.eye(adjacency.size(0), device=adjacency.device)
+    adjacency_hat = adjacency + identity
     
     # Calculate degree matrix D
-    D = torch.sum(A_hat, dim=1)
+    degree = torch.sum(adjacency_hat, dim=1)
     
     # D^{-1/2}
-    D_inv_sqrt = torch.pow(D, -0.5)
-    D_inv_sqrt[torch.isinf(D_inv_sqrt)] = 0.0 # Handle division by zero
+    degree_inv_sqrt = torch.pow(degree, -0.5)
+    degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0  # Handle division by zero
     
     # Create diagonal matrix for D^{-1/2}
-    D_inv_sqrt_mat = torch.diag(D_inv_sqrt)
+    degree_inv_sqrt_mat = torch.diag(degree_inv_sqrt)
     
     # D^{-1/2} * (A + I) * D^{-1/2}
-    normalized_A = torch.mm(torch.mm(D_inv_sqrt_mat, A_hat), D_inv_sqrt_mat)
-    return normalized_A
+    normalized_adjacency = torch.mm(
+        torch.mm(degree_inv_sqrt_mat, adjacency_hat), degree_inv_sqrt_mat
+    )
+    return normalized_adjacency
 
 class GCNLayer(nn.Module):
-    """
-    A single GCN layer implementing X^{(l+1)} = \sigma(D^{-1/2}(A+I)D^{-1/2} X^{(l)} W^{(l)})
-    """
+    """Single GCN layer for X^{(l+1)} = σ(D^{-1/2}(A+I)D^{-1/2}X^{(l)}W^{(l)})."""
+
     def __init__(self, in_features: int, out_features: int):
+        """Initialize the GCN layer.
+
+        Args:
+            in_features: Input feature dimension.
+            out_features: Output feature dimension.
+        """
         super(GCNLayer, self).__init__()
         # Trainable weight matrix W^{(l)}
         self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
         # Initialize weights
         nn.init.xavier_uniform_(self.weight)
 
-    def forward(self, X: torch.Tensor, normalized_A: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, normalized_adjacency: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            features: Node feature matrix.
+            normalized_adjacency: Normalized adjacency matrix.
+
+        Returns:
+            Updated node features.
+        """
         # X * W
-        support = torch.mm(X, self.weight)
+        support = torch.mm(features, self.weight)
         # normalized_A * (X * W)
-        output = torch.mm(normalized_A, support)
+        output = torch.mm(normalized_adjacency, support)
         return output
 
 class TaskPriorityGCN(nn.Module):
-    """
-    The 3-layer GCN architecture for extracting subtask execution priorities.
-    """
+    """3-layer GCN architecture for subtask priority prediction."""
+
     def __init__(self, num_features: int, hidden_dim: int = 32):
+        """Initialize the GCN model.
+
+        Args:
+            num_features: Input node feature dimension.
+            hidden_dim: Hidden layer width.
+        """
         super(TaskPriorityGCN, self).__init__()
         # Layer 1: Input to Hidden
         self.gcn1 = GCNLayer(num_features, hidden_dim)
@@ -56,24 +84,29 @@ class TaskPriorityGCN(nn.Module):
         # Layer 3: Hidden to Output (1 scalar priority value per subtask)
         self.gcn3 = GCNLayer(hidden_dim, 1)
 
-    def forward(self, X: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
-        """
-        X: Node feature matrix (e.g., subtask hierarchy, out-degree, computation volume)
-        A: Adjacency matrix of the DAG
+    def forward(self, features: torch.Tensor, adjacency: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the GCN.
+
+        Args:
+            features: Node feature matrix.
+            adjacency: DAG adjacency matrix.
+
+        Returns:
+            Priority score per node.
         """
         # Precompute the normalized adjacency matrix
-        normalized_A = normalize_adjacency(A)
+        normalized_adjacency = normalize_adjacency(adjacency)
         
         # Layer 1 + ReLU
-        x = self.gcn1(X, normalized_A)
+        x = self.gcn1(features, normalized_adjacency)
         x = F.relu(x)
         
         # Layer 2 + ReLU
-        x = self.gcn2(x, normalized_A)
+        x = self.gcn2(x, normalized_adjacency)
         x = F.relu(x)
         
         # Layer 3 (Output layer to predict priority score)
-        x = self.gcn3(x, normalized_A)
+        x = self.gcn3(x, normalized_adjacency)
         
         return x
 

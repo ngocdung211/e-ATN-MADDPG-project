@@ -1,26 +1,50 @@
+"""Replay buffer for multi-agent experience storage."""
+
 import random
-import torch
 from collections import deque
-from typing import Tuple, List
+from typing import Deque, List, Tuple
+
 import numpy as np
+import torch
 
 class MultiAgentReplayBuffer:
-    """
-    Stores joint experiences for the MADDPG agents.
-    """
-    def __init__(self, capacity: int = 100000):
-        self.buffer = deque(maxlen=capacity)
+    """Store joint experiences for multi-agent training."""
 
-    def push(self, state: List[float], action: List[int], reward: List[float], next_state: List[float]):
+    def __init__(self, capacity: int = 100000):
+        """Initialize the replay buffer.
+
+        Args:
+            capacity: Maximum number of experiences to store.
         """
-        Stores a joint experience tuple (S, A, R, S').
-        Lists should be of length D (number of agents).
+        self.buffer: Deque[Tuple[List[float], List[int], List[float], List[float]]] = deque(
+            maxlen=capacity
+        )
+
+    def push(
+        self,
+        state: List[float],
+        action: List[int],
+        reward: List[float],
+        next_state: List[float],
+    ) -> None:
+        """Store a joint experience tuple (S, A, R, S').
+
+        Args:
+            state: Joint state for all agents.
+            action: Joint actions for all agents.
+            reward: Joint rewards for all agents.
+            next_state: Next joint state for all agents.
         """
         self.buffer.append((state, action, reward, next_state))
 
     def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Samples a random mini-batch of experiences.
+        """Sample a random mini-batch of experiences.
+
+        Args:
+            batch_size: Number of samples to draw.
+
+        Returns:
+            Tuple of (states, actions, rewards, next_states).
         """
         batch = random.sample(self.buffer, batch_size)
         
@@ -31,5 +55,6 @@ class MultiAgentReplayBuffer:
         
         return state_batch, action_batch, reward_batch, next_state_batch
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of stored experiences."""
         return len(self.buffer)

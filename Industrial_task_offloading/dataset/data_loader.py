@@ -1,24 +1,31 @@
+"""Dataset loader for KolektorSDD images and task parameter generation."""
+
 import os
 import random
-import numpy as np
+from typing import Dict, List
+
 from PIL import Image
 
 class KolektorSDDLoader:
-    """
-    Loads images from the KolektorSDD dataset and translates their physical 
-    properties into parameters for the TaskDAG subtasks.
-    """
-    def __init__(self, dataset_path: str):
-        self.dataset_path = dataset_path
-        self.image_paths = self._index_dataset()
+    """Load KolektorSDD images and derive TaskDAG subtask parameters."""
 
-    def _index_dataset(self) -> list:
+    def __init__(self, dataset_path: str):
+        """Initialize the loader.
+
+        Args:
+            dataset_path: Root path to the KolektorSDD dataset.
         """
-        Scans the dataset directory and collects all image file paths.
-        Assuming a standard extracted folder structure for KolektorSDD.
+        self.dataset_path: str = dataset_path
+        self.image_paths: List[str] = self._index_dataset()
+
+    def _index_dataset(self) -> List[str]:
+        """Scan the dataset directory and collect image file paths.
+
+        Returns:
+            List of absolute file paths for valid image files.
         """
-        valid_extensions = ('.jpg', '.png', '.bmp')
-        image_paths = []
+        valid_extensions = (".jpg", ".png", ".bmp")
+        image_paths: List[str] = []
         
         if not os.path.exists(self.dataset_path):
             print(f"Warning: Dataset path '{self.dataset_path}' not found.")
@@ -32,14 +39,15 @@ class KolektorSDDLoader:
                     
         return image_paths
 
-    def get_random_task_parameters(self) -> dict:
-        """
-        Picks a random image and generates realistic data sizes and CPU cycle 
-        estimates for the 5-stage image recognition DAG.
+    def get_random_task_parameters(self) -> Dict[str, Dict[str, float]]:
+        """Generate subtask parameters from a random image.
+
+        Returns:
+            Mapping of subtask keys to data_size, result_size, and cpu_cycles.
         """
         if not self.image_paths:
             # Fallback to dummy data if the dataset isn't downloaded yet
-            file_size_bits = random.uniform(1e6, 5e6) # 1 to 5 Megabits
+            file_size_bits = random.uniform(1e6, 5e6)  # 1 to 5 Megabits
             pixels = random.randint(500000, 2000000)
         else:
             # Load actual image properties
@@ -59,31 +67,44 @@ class KolektorSDDLoader:
         # proportionally based on the real image size and pixel count.
         
         task_params = {
-            "subtask_1": { # Image Extraction
-                "data_size": file_size_bits, 
-                "result_size": file_size_bits * 1.2, # Uncompressed data
-                "cpu_cycles": pixels * 10 
+            "subtask_1": {  # Image Extraction
+                "data_size": file_size_bits,
+                "result_size": file_size_bits * 1.2,  # Uncompressed data
+                "cpu_cycles": pixels * 10,
             },
-            "subtask_2": { # Image Denoising
+            "subtask_2": {  # Image Denoising
                 "data_size": file_size_bits * 1.2,
                 "result_size": file_size_bits * 1.2,
-                "cpu_cycles": pixels * 50 # Compute intensive filter
+                "cpu_cycles": pixels * 50,  # Compute intensive filter
             },
-            "subtask_3": { # Standardization
+            "subtask_3": {  # Standardization
                 "data_size": file_size_bits * 1.2,
-                "result_size": file_size_bits * 0.8, # Resizing/Cropping
-                "cpu_cycles": pixels * 20
+                "result_size": file_size_bits * 0.8,  # Resizing/Cropping
+                "cpu_cycles": pixels * 20,
             },
-            "subtask_4": { # Feature Extraction (e.g., passing through CNN layers)
+            "subtask_4": {  # Feature Extraction (e.g., passing through CNN layers)
                 "data_size": file_size_bits * 0.8,
-                "result_size": file_size_bits * 0.1, # Vector representation
-                "cpu_cycles": pixels * 200 # Highly compute intensive
+                "result_size": file_size_bits * 0.1,  # Vector representation
+                "cpu_cycles": pixels * 200,  # Highly compute intensive
             },
-            "subtask_5": { # Detection and Recognition
+            "subtask_5": {  # Detection and Recognition
                 "data_size": file_size_bits * 0.1,
-                "result_size": 256, # Just a classification result/bounding box (small)
-                "cpu_cycles": pixels * 50
-            }
+                "result_size": 256,  # Small classification result/bounding box
+                "cpu_cycles": pixels * 50,
+            },
         }
         
         return task_params
+
+    def get_dataset_statistics(self) -> Dict[str, int]:
+        """Return dataset statistics used in experiments.
+
+        Returns:
+            Mapping with dataset counts and alignment with the paper.
+        """
+        total = len(self.image_paths)
+        return {
+            "total_images": total,
+            "paper_expected_total_images": 399,
+            "is_paper_count_aligned": total == 399,
+        }

@@ -1,12 +1,16 @@
+"""Digital twin environment for industrial task offloading."""
+
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from environment.network_env import NetworkEnvironment
-from environment.system_model import EdgeServer, IndustrialDevice, TaskDAG
+from environment.system_model import EdgeServer, IndustrialDevice, Subtask, TaskDAG
 
 
 class DITENEnv:
+    """Digital twin industrial task offloading environment."""
+
     def __init__(
         self,
         devices: List[IndustrialDevice],
@@ -15,37 +19,58 @@ class DITENEnv:
         slot_duration: float = 1.0,
         subslot_count: int = 100,
         lambda1: float = 1.0,
-        lambda2: float = 0.2,
+        lambda2: float = 1.0,
         lambda3: float = 1.0,
-        lambda4: float = 0.2,
+        lambda4: float = 1.0,
         lambda5: float = 0.5,
-        p_out_value: float = -1.0,
+        p_out_value: float = -1,
         local_estimation_error: float = 0.05,
         edge_estimation_error: float = 0.05,
-        connection_lookahead_slots: int = 5,
-        edge_energy_scale: float = 0.2,
+        time_slots: int = 50,
+        strict_connection_window: bool = True,
     ):
-        self.devices = devices
-        self.servers = servers
-        self.network_env = network_env
-        self.num_agents = len(devices)
+        """Initialize the DITEN environment.
 
-        self.slot_duration = slot_duration
-        self.subslot_count = subslot_count
+        Args:
+            devices: Industrial devices participating in the episode.
+            servers: Edge servers available for offloading.
+            network_env: Communication and computation model.
+            slot_duration: Duration of one time slot (seconds).
+            subslot_count: Number of subslots used to detect coverage windows.
+            lambda1: Reward coefficient for immediate delay.
+            lambda2: Reward coefficient for accumulated delay.
+            lambda3: Reward coefficient for immediate energy.
+            lambda4: Reward coefficient for accumulated energy.
+            lambda5: Reward coefficient for outage penalty.
+            p_out_value: Penalty value applied on connection window violations.
+            local_estimation_error: Relative error for local power estimation.
+            edge_estimation_error: Relative error for edge power estimation.
+            time_slots: Number of time slots per episode.
+            strict_connection_window: Enforce strict coverage window constraint.
+        """
+        self.devices: List[IndustrialDevice] = devices
+        self.servers: List[EdgeServer] = servers
+        self.network_env: NetworkEnvironment = network_env
+        self.num_agents: int = len(devices)
 
-        self.lambda1 = lambda1
-        self.lambda2 = lambda2
-        self.lambda3 = lambda3
-        self.lambda4 = lambda4
-        self.lambda5 = lambda5
-        self.p_out_value = p_out_value
-        self.local_estimation_error = max(0.0, local_estimation_error)
-        self.edge_estimation_error = max(0.0, edge_estimation_error)
-        self.connection_lookahead_slots = max(1, connection_lookahead_slots)
-        self.edge_energy_scale = max(0.0, edge_energy_scale)
+        self.slot_duration: float = slot_duration
+        self.subslot_count: int = subslot_count
+        self.time_slots: int = max(1, int(time_slots))
+
+        self.lambda1: float = lambda1
+        self.lambda2: float = lambda2
+        self.lambda3: float = lambda3
+        self.lambda4: float = lambda4
+        self.lambda5: float = lambda5
+        self.p_out_value: float = p_out_value
+        self.local_estimation_error: float = max(0.0, local_estimation_error)
+        self.edge_estimation_error: float = max(0.0, edge_estimation_error)
+        self.strict_connection_window: bool = bool(strict_connection_window)
 
         self.device_accumulated_delay: Dict[int, float] = {}
         self.device_accumulated_energy: Dict[int, float] = {}
+        self.slot_accumulated_delay: Dict[int, float] = {}
+        self.slot_accumulated_energy: Dict[int, float] = {}
         self.subtask_finish_times: Dict[int, Dict[int, float]] = {}
         self.subtask_locations: Dict[int, Dict[int, int]] = {}
         self.local_finish_time: Dict[int, float] = {}
@@ -53,25 +78,69 @@ class DITENEnv:
 
         self.task_dags: Dict[int, TaskDAG] = {}
         self.priorities: Dict[int, List[int]] = {}
-        self.current_step = 0
-        self.current_slot = 0.0
+        self.current_step: Dict[int, int] = {d.id: 0 for d in self.devices}
+        self.current_slot_index: int = 0
+        self.current_slot: float = 0.0
         self.connection_windows: Dict[Tuple[int, int], Tuple[float, float]] = {}
         self.last_step_metrics: List[Dict[str, float]] = []
         self.device_estimated_power: Dict[int, float] = {}
         self.server_estimated_power: Dict[int, float] = {}
+        self.device_waypoints: Dict[int, List[np.ndarray]] = {}
+        self.device_waypoint_idx: Dict[int, int] = {}
+        self.world_min: np.ndarray = np.array([0.0, 0.0], dtype=float)
+        self.world_max: np.ndarray = np.array([100.0, 100.0], dtype=float)
+        self._build_predetermined_paths()
 
-    def reset(self, task_dags: Dict[int, TaskDAG], priorities: Dict[int, List[int]]) -> np.ndarray:
-        self.task_dags = task_dags
-        self.priorities = priorities
-        self.current_step = 0
+    def reset_episode(self) -> None:
+        """Reset episode state, device positions, and connection windows."""
+        self.current_step = {d.id: 0 for d in self.devices}
+        self.current_slot_index = 0
         self.current_slot = 0.0
 
         self.device_accumulated_delay = {d.id: 0.0 for d in self.devices}
         self.device_accumulated_energy = {d.id: 0.0 for d in self.devices}
+        self.slot_accumulated_delay = {d.id: 0.0 for d in self.devices}
+        self.slot_accumulated_energy = {d.id: 0.0 for d in self.devices}
+        self.task_dags = {}
+        self.priorities = {}
+        self.subtask_finish_times = {}
+        self.subtask_locations = {}
+        self.local_finish_time = {}
+        self.server_finish_time = {}
+        self.last_step_metrics = []
+
+        for device in self.devices:
+            waypoint_index = self.device_waypoint_idx[device.id]
+            waypoints = self.device_waypoints[device.id]
+            device.update_location(waypoints[waypoint_index].copy())
+            next_waypoint = waypoints[(waypoint_index + 1) % (len(waypoints) - 1)]
+            direction = next_waypoint - waypoints[waypoint_index]
+            device.set_direction(direction)
+
+        self._update_connection_windows()
+
+    def start_time_slot(
+        self, task_dags: Dict[int, TaskDAG], priorities: Dict[int, List[int]]
+    ) -> np.ndarray:
+        """Initialize a new time slot with task DAGs and priority orders.
+
+        Args:
+            task_dags: Mapping of device IDs to TaskDAG instances.
+            priorities: Mapping of device IDs to ordered subtask IDs.
+
+        Returns:
+            Joint state array for all devices.
+        """
+        self.task_dags = task_dags
+        self.priorities = priorities
+        self.current_step = {d.id: 0 for d in self.devices}
+
         self.subtask_finish_times = {d.id: {} for d in self.devices}
         self.subtask_locations = {d.id: {} for d in self.devices}
         self.local_finish_time = {d.id: 0.0 for d in self.devices}
         self.server_finish_time = {s.id: 0.0 for s in self.servers}
+        self.slot_accumulated_delay = {d.id: 0.0 for d in self.devices}
+        self.slot_accumulated_energy = {d.id: 0.0 for d in self.devices}
         self.last_step_metrics = []
         self.device_estimated_power = {
             d.id: self._sample_estimated_power(d.compute_power, self.local_estimation_error) for d in self.devices
@@ -80,149 +149,589 @@ class DITENEnv:
             s.id: self._sample_estimated_power(s.compute_power, self.edge_estimation_error) for s in self.servers
         }
 
-        for device in self.devices:
-            direction = np.random.uniform(-1, 1, 2)
-            norm = np.linalg.norm(direction)
-            if norm == 0:
-                direction = np.array([1.0, 0.0], dtype=float)
-            device.set_direction(direction)
-
         self._update_connection_windows()
         return self._get_joint_state()
 
-    def step(self, joint_actions: List[int]) -> Tuple[np.ndarray, List[float], bool, dict]:
-        rewards = []
-        step_durations = []
+    def reset(self, task_dags: Dict[int, TaskDAG], priorities: Dict[int, List[int]]) -> np.ndarray:
+        """Reset the episode and start the first time slot.
+
+        Args:
+            task_dags: Mapping of device IDs to TaskDAG instances.
+            priorities: Mapping of device IDs to ordered subtask IDs.
+
+        Returns:
+            Joint state array for all devices.
+        """
+        # Backward-compatible entrypoint: reset full episode then initialize first slot.
+        self.reset_episode()
+        return self.start_time_slot(task_dags, priorities)
+
+    def step(self, joint_actions: List[int]) -> Tuple[np.ndarray, List[float], bool, Dict[str, bool]]:
+        """Advance one scheduling step.
+
+        Args:
+            joint_actions: One action per device (0 for local, >0 for edge server).
+
+        Returns:
+            Tuple of (next_state, rewards, episode_done, info).
+        """
         self.last_step_metrics = []
 
-        for idx, action in enumerate(joint_actions):
-            device = self.devices[idx]
+        local_finish_snapshot = dict(self.local_finish_time)
+        server_finish_snapshot = dict(self.server_finish_time)
+
+        pending, server_groups = self._build_pending_items(joint_actions)
+        self._schedule_local_items(pending, local_finish_snapshot)
+        self._schedule_edge_items(server_groups, local_finish_snapshot, server_finish_snapshot)
+
+        self.local_finish_time = local_finish_snapshot
+        self.server_finish_time = server_finish_snapshot
+
+        rewards = self._finalize_pending_items(pending)
+
+        subtask_count = len(self.task_dags[self.devices[0].id].subtasks)
+        slot_done = all(self.current_step[d.id] >= subtask_count for d in self.devices)
+        self._advance_mobility_within_slot(subtask_count)
+
+        if slot_done:
+            self.current_slot_index += 1
+            self.current_slot = self.current_slot_index * self.slot_duration
+            self._update_connection_windows()
+
+        episode_done = self.current_slot_index >= self.time_slots
+        info = {"slot_done": slot_done, "episode_done": episode_done}
+        return self._get_joint_state(), rewards, episode_done, info
+
+    def _build_pending_items(self, joint_actions: List[int]) -> Tuple[List[dict], Dict[int, List[dict]]]:
+        """Create per-device execution items and group edge actions by server.
+
+        Args:
+            joint_actions: One action per device.
+
+        Returns:
+            Tuple of (pending_items, server_groups).
+        """
+        pending: List[dict] = []
+        server_groups: Dict[int, List[dict]] = {}
+
+        for device_index, requested_action in enumerate(joint_actions):
+            device = self.devices[device_index]
             task_dag = self.task_dags[device.id]
-            current_subtask_id = self.priorities[device.id][self.current_step]
+            step_idx = self.current_step[device.id]
+            priority_list = self.priorities.get(device.id, [])
+            if step_idx >= len(priority_list):
+                pending.append(
+                    {
+                        "idx": device_index,
+                        "device": device,
+                        "completed": True,
+                        "requested_action": None,
+                        "p_out": 0.0,
+                    }
+                )
+                continue
+            current_subtask_id = priority_list[step_idx]
             subtask = task_dag.subtasks[current_subtask_id]
 
-            t_im = 0.0
-            e_im = 0.0
-            tx_energy = 0.0
-            p_out = 0.0
+            predecessor_ready_time, tx_energy = self._resolve_predecessor_ready_time(
+                device=device, task_dag=task_dag, current_subtask_id=current_subtask_id, action=requested_action
+            )
 
-            predecessors = [pred for pred, succ in task_dag.edges if succ == current_subtask_id]
-            predecessor_ready_time = 0.0
-            for pred_id in predecessors:
-                pred_finish = self.subtask_finish_times[device.id].get(pred_id, 0.0)
-                pred_location = self.subtask_locations[device.id].get(pred_id, 0)
-                if pred_location != action:
-                    trans_delay = 0.0
-                    if action == 0 and pred_location > 0:
-                        pred_server = self.servers[pred_location - 1]
-                        gain = self.network_env.calculate_channel_gain(device.location, pred_server.location)
-                        down_rate = max(self.network_env.get_downlink_rate(pred_server.transmit_power, gain), 1e-9)
-                        trans_delay = task_dag.subtasks[pred_id].result_size / down_rate
-                    elif action > 0:
-                        target_server = self.servers[action - 1]
-                        gain = self.network_env.calculate_channel_gain(device.location, target_server.location)
-                        up_rate = max(self.network_env.get_uplink_rate(device.transmit_power, gain), 1e-9)
-                        trans_delay = task_dag.subtasks[pred_id].result_size / up_rate
-                        tx_energy += device.transmit_power * trans_delay
-                    pred_finish += trans_delay
-                predecessor_ready_time = max(predecessor_ready_time, pred_finish)
+            item = {
+                "idx": device_index,
+                "device": device,
+                "task_dag": task_dag,
+                "subtask_id": current_subtask_id,
+                "subtask": subtask,
+                "requested_action": requested_action,
+                "predecessor_ready_time": predecessor_ready_time,
+                "tx_energy": tx_energy,
+                "p_out": 0.0,
+                "rejected": False,
+            }
+            pending.append(item)
+            if requested_action > 0:
+                server_groups.setdefault(requested_action, []).append(item)
 
-            if action == 0:
-                f_est = self.device_estimated_power[device.id]
-                f_actual = device.compute_power
-                t_comp, e_comp = self.network_env.calculate_local_computation(
-                    subtask.cpu_cycles, device.energy_coeff, f_est, f_actual
+        return pending, server_groups
+
+    def _schedule_local_items(self, pending: List[dict], local_finish_snapshot: Dict[int, float]) -> None:
+        """Schedule local execution items and update their timings.
+
+        Args:
+            pending: Items awaiting scheduling.
+            local_finish_snapshot: Copy of device local finish times.
+        """
+        for item in pending:
+            if item["requested_action"] != 0:
+                continue
+            device = item["device"]
+            subtask = item["subtask"]
+            est_power = self.device_estimated_power[device.id]
+            actual_power = device.compute_power
+            comp_time, comp_energy = self.network_env.calculate_local_computation(
+                subtask.cpu_cycles, device.energy_coeff, est_power, actual_power
+            )
+            local_wait = max(0.0, local_finish_snapshot[device.id] - self.current_slot)
+            start_time = max(self.current_slot + local_wait, item["predecessor_ready_time"])
+            finish_time = start_time + comp_time
+            local_finish_snapshot[device.id] = finish_time
+
+            item.update(
+                {
+                    "resolved_action": 0,
+                    "start_time": start_time,
+                    "finish_time": finish_time,
+                    "f_est": est_power,
+                    "f_actual": actual_power,
+                    "e_comp": comp_energy,
+                }
+            )
+
+    def _schedule_edge_items(
+        self,
+        server_groups: Dict[int, List[dict]],
+        local_finish_snapshot: Dict[int, float],
+        server_finish_snapshot: Dict[int, float],
+    ) -> None:
+        """Schedule edge execution items, enforcing connection windows.
+
+        Args:
+            server_groups: Items grouped by requested edge server index.
+            local_finish_snapshot: Copy of device local finish times.
+            server_finish_snapshot: Copy of server finish times.
+        """
+        for action, group in server_groups.items():
+            server = self.servers[action - 1]
+            server_available_time = server_finish_snapshot[server.id]
+            est_power = self.server_estimated_power[server.id]
+            actual_power = server.compute_power
+
+            for item in group:
+                window_start, window_end = self.connection_windows[(item["device"].id, server.id)]
+                item["l_start"] = window_start
+                item["l_end"] = window_end
+
+            group.sort(
+                key=lambda item: (
+                    max(item["predecessor_ready_time"], item["l_start"] + 1e-9),
+                    item["device"].id,
                 )
-                w_d = self._compute_waiting_delay_local(device)
-                start_time = max(self.current_slot + w_d, predecessor_ready_time)
-                finish_time = start_time + t_comp
-                self.local_finish_time[device.id] = finish_time
-            else:
-                server = self.servers[action - 1]
-                f_est = self.server_estimated_power[server.id]
-                f_actual = server.compute_power
-                t_comp, e_comp = self.network_env.calculate_edge_computation(
-                    subtask.cpu_cycles, server.energy_coeff, f_est, f_actual
+            )
+
+            for item in group:
+                subtask = item["subtask"]
+                comp_time, comp_energy = self.network_env.calculate_edge_computation(
+                    subtask.cpu_cycles, server.energy_coeff, est_power, actual_power
                 )
-                e_comp *= self.edge_energy_scale
-                w_s = self._compute_waiting_delay_server(server)
-                l_start, l_end = self.connection_windows[(device.id, server.id)]
-                start_time = max(self.current_slot + w_s, predecessor_ready_time, l_start + 1e-9)
-                finish_time = start_time + t_comp
-                if not (start_time > l_start and finish_time < l_end):
-                    p_out = self.p_out_value
-                self.server_finish_time[server.id] = finish_time
+                start_time = max(
+                    self.current_slot,
+                    server_available_time,
+                    item["predecessor_ready_time"],
+                    item["l_start"] + 1e-9,
+                )
+                finish_time = start_time + comp_time
+                within_window = start_time > item["l_start"] and finish_time < item["l_end"]
+                if (not within_window) and self.strict_connection_window:
+                    # Reject invalid offload and fallback to local execution with penalty.
+                    device = item["device"]
+                    local_est_power = self.device_estimated_power[device.id]
+                    local_actual_power = device.compute_power
+                    local_time, local_energy = self.network_env.calculate_local_computation(
+                        subtask.cpu_cycles, device.energy_coeff, local_est_power, local_actual_power
+                    )
+                    local_wait = max(0.0, local_finish_snapshot[device.id] - self.current_slot)
+                    local_start = max(self.current_slot + local_wait, item["predecessor_ready_time"])
+                    local_finish = local_start + local_time
+                    local_finish_snapshot[device.id] = local_finish
+                    item["rejected"] = True
+                    item["p_out"] = self.p_out_value
+                    item.update(
+                        {
+                            "resolved_action": 0,
+                            "start_time": local_start,
+                            "finish_time": local_finish,
+                            "f_est": local_est_power,
+                            "f_actual": local_actual_power,
+                            "e_comp": local_energy,
+                        }
+                    )
+                    continue
 
-            t_im = max(0.0, finish_time - self.current_slot)
-            e_im = tx_energy + e_comp
+                item["p_out"] = self.p_out_value if not within_window else 0.0
+                if item["rejected"]:
+                    item.update(
+                        {
+                            "resolved_action": action,
+                            "f_est": est_power,
+                            "f_actual": actual_power,
+                        }
+                    )
+                else:
+                    item.update(
+                        {
+                            "resolved_action": action,
+                            "start_time": start_time,
+                            "finish_time": finish_time,
+                            "f_est": est_power,
+                            "f_actual": actual_power,
+                            "e_comp": comp_energy,
+                        }
+                    )
+                    server_available_time = finish_time
+                    server_finish_snapshot[server.id] = server_available_time
 
-            self.subtask_finish_times[device.id][current_subtask_id] = finish_time
-            self.subtask_locations[device.id][current_subtask_id] = action
+    def _finalize_pending_items(self, pending: List[dict]) -> List[float]:
+        """Compute rewards and update per-device metrics for scheduled items.
 
-            t_accm = self.device_accumulated_delay[device.id]
-            e_accm = self.device_accumulated_energy[device.id]
-            self.device_accumulated_delay[device.id] += t_im
-            self.device_accumulated_energy[device.id] += e_im
+        Args:
+            pending: Items scheduled in the current step.
 
-            reward = self._calculate_reward(t_im, e_im, t_accm, e_accm, p_out, task_dag)
+        Returns:
+            Reward list aligned with device order.
+        """
+        rewards: List[float] = []
+        pending.sort(key=lambda item: item["idx"])
+
+        for item in pending:
+            device = item["device"]
+            if item.get("completed"):
+                rewards.append(0.0)
+                self.last_step_metrics.append(
+                    {
+                        "device_id": float(device.id),
+                        "subtask_id": -1.0,
+                        "action": -1.0,
+                        "f_est": 0.0,
+                        "f_actual": 0.0,
+                        "delay": 0.0,
+                        "energy": 0.0,
+                        "tx_energy": 0.0,
+                        "comp_energy": 0.0,
+                        "reward": 0.0,
+                        "p_out": 0.0,
+                    }
+                )
+                continue
+            task_dag = item["task_dag"]
+            current_subtask_id = item["subtask_id"]
+
+            if item.get("rejected"):
+                accum_delay = self.slot_accumulated_delay[device.id]
+                accum_energy = self.slot_accumulated_energy[device.id]
+                reward = self._calculate_reward(0.0, 0.0, accum_delay, accum_energy, item["p_out"], task_dag)
+                rewards.append(reward)
+                self.last_step_metrics.append(
+                    {
+                        "device_id": float(device.id),
+                        "subtask_id": float(current_subtask_id),
+                        "action": float(item.get("resolved_action", 0)),
+                        "f_est": float(item.get("f_est", 0.0)),
+                        "f_actual": float(item.get("f_actual", 0.0)),
+                        "delay": 0.0,
+                        "energy": 0.0,
+                        "tx_energy": float(item.get("tx_energy", 0.0)),
+                        "comp_energy": 0.0,
+                        "reward": float(reward),
+                        "p_out": float(item["p_out"]),
+                    }
+                )
+                continue
+
+            instant_delay = max(0.0, item["finish_time"] - self.current_slot)
+            instant_energy = item["tx_energy"] + item["e_comp"]
+
+            self.subtask_finish_times[device.id][current_subtask_id] = item["finish_time"]
+            self.subtask_locations[device.id][current_subtask_id] = item["resolved_action"]
+
+            accum_delay = self.slot_accumulated_delay[device.id]
+            accum_energy = self.slot_accumulated_energy[device.id]
+            self.slot_accumulated_delay[device.id] += instant_delay
+            self.slot_accumulated_energy[device.id] += instant_energy
+            self.device_accumulated_delay[device.id] += instant_delay
+            self.device_accumulated_energy[device.id] += instant_energy
+
+            reward = self._calculate_reward(
+                instant_delay, instant_energy, accum_delay, accum_energy, item["p_out"], task_dag
+            )
             rewards.append(reward)
-            step_durations.append(t_im)
             self.last_step_metrics.append(
                 {
                     "device_id": float(device.id),
                     "subtask_id": float(current_subtask_id),
-                    "action": float(action),
-                    "f_est": float(f_est),
-                    "f_actual": float(f_actual),
-                    "delay": float(t_im),
-                    "energy": float(e_im),
-                    "tx_energy": float(tx_energy),
-                    "comp_energy": float(e_comp),
+                    "action": float(item["resolved_action"]),
+                    "f_est": float(item["f_est"]),
+                    "f_actual": float(item["f_actual"]),
+                    "delay": float(instant_delay),
+                    "energy": float(instant_energy),
+                    "tx_energy": float(item["tx_energy"]),
+                    "comp_energy": float(item["e_comp"]),
                     "reward": float(reward),
-                    "p_out": float(p_out),
+                    "p_out": float(item["p_out"]),
                 }
             )
 
-        elapsed = max(step_durations) if step_durations else self.slot_duration
-        for device in self.devices:
-            device.update_location(device.project_location(elapsed))
+            self.current_step[device.id] += 1
 
-        self.current_slot += max(self.slot_duration, elapsed)
-        self._update_connection_windows()
-        self.current_step += 1
-        done = self.current_step >= len(self.task_dags[self.devices[0].id].subtasks)
-        return self._get_joint_state(), rewards, done, {}
+        return rewards
+
+    def _advance_mobility_within_slot(self, subtask_count: int) -> None:
+        """Advance device mobility within the current time slot.
+
+        Args:
+            subtask_count: Total subtasks per device in this slot.
+        """
+        slot_end_time = (self.current_slot_index + 1) * self.slot_duration
+        elapsed_per_subtask = self.slot_duration / max(subtask_count, 1)
+        remaining_in_slot = max(0.0, slot_end_time - self.current_slot)
+        elapsed = min(elapsed_per_subtask, remaining_in_slot)
+        if elapsed > 0.0:
+            for device in self.devices:
+                self._move_device_on_path(device, elapsed)
+            self.current_slot += elapsed
+            self._update_connection_windows()
+
+    def _resolve_predecessor_ready_time(
+        self, device: IndustrialDevice, task_dag: TaskDAG, current_subtask_id: int, action: int
+    ) -> Tuple[float, float]:
+        """Compute earliest start time and transfer energy from predecessors.
+
+        Args:
+            device: Device executing the subtask.
+            task_dag: Task DAG for the device.
+            current_subtask_id: Current subtask identifier.
+            action: Requested execution location (0 local, >0 edge).
+
+        Returns:
+            Tuple of (predecessor_ready_time, transfer_energy).
+        """
+        predecessors = [pred for pred, succ in task_dag.edges if succ == current_subtask_id]
+        predecessor_ready_time = 0.0
+        tx_energy = 0.0
+        for pred_id in predecessors:
+            pred_finish = self.subtask_finish_times[device.id].get(pred_id, 0.0)
+            pred_location = self.subtask_locations[device.id].get(pred_id, 0)
+            if pred_location != action:
+                trans_delay, trans_energy = self._calculate_result_transfer(
+                    device, task_dag, pred_id, pred_location, action
+                )
+                pred_finish += trans_delay
+                tx_energy += trans_energy
+            predecessor_ready_time = max(predecessor_ready_time, pred_finish)
+
+        # Eq. (15)-(17) term for first offloaded subtask: upload raw subtask input to edge server.
+        if action > 0 and len(predecessors) == 0:
+            input_delay, input_energy = self._calculate_input_upload(
+                device, action, task_dag.subtasks[current_subtask_id].data_size
+            )
+            predecessor_ready_time += input_delay
+            tx_energy += input_energy
+
+        return predecessor_ready_time, tx_energy
+
+    def _calculate_result_transfer(
+        self, device: IndustrialDevice, task_dag: TaskDAG, pred_id: int, pred_location: int, action: int
+    ) -> Tuple[float, float]:
+        """Return transfer delay and energy when predecessor results move nodes.
+
+        Args:
+            device: Device executing the current subtask.
+            task_dag: Task DAG containing subtask metadata.
+            pred_id: Predecessor subtask ID.
+            pred_location: Execution location of predecessor.
+            action: Execution location for current subtask.
+
+        Returns:
+            Tuple of (transfer_delay, transfer_energy).
+        """
+        if pred_location == action:
+            return 0.0, 0.0
+        if action == 0 and pred_location > 0:
+            pred_server = self.servers[pred_location - 1]
+            gain = self.network_env.calculate_channel_gain(device.location, pred_server.location)
+            down_rate = max(self.network_env.get_downlink_rate(pred_server.transmit_power, gain), 1e-9)
+            trans_delay = task_dag.subtasks[pred_id].result_size / down_rate
+            return trans_delay, pred_server.transmit_power * trans_delay
+        if action > 0 and pred_location == 0:
+            target_server = self.servers[action - 1]
+            gain = self.network_env.calculate_channel_gain(device.location, target_server.location)
+            up_rate = max(self.network_env.get_uplink_rate(device.transmit_power, gain), 1e-9)
+            trans_delay = task_dag.subtasks[pred_id].result_size / up_rate
+            return trans_delay, device.transmit_power * trans_delay
+        return 0.0, 0.0
+
+    def _calculate_input_upload(self, device: IndustrialDevice, action: int, data_size: float) -> Tuple[float, float]:
+        """Return upload delay and energy for initial subtask input.
+
+        Args:
+            device: Device uploading input data.
+            action: Target execution location (0 local, >0 edge).
+            data_size: Input data size (bytes).
+
+        Returns:
+            Tuple of (upload_delay, upload_energy).
+        """
+        if action <= 0:
+            return 0.0, 0.0
+        target_server = self.servers[action - 1]
+        gain = self.network_env.calculate_channel_gain(device.location, target_server.location)
+        up_rate = max(self.network_env.get_uplink_rate(device.transmit_power, gain), 1e-9)
+        upload_delay = data_size / up_rate
+        return upload_delay, device.transmit_power * upload_delay
+
+    def _schedule_subtask_execution(
+        self, device: IndustrialDevice, subtask: Subtask, action: int, predecessor_ready_time: float
+    ) -> Tuple[float, float, float, float, float, float]:
+        """Schedule a subtask on local or edge resources.
+
+        Args:
+            device: Device executing the subtask.
+            subtask: Subtask metadata.
+            action: Execution location (0 local, >0 edge).
+            predecessor_ready_time: Earliest time allowed by dependencies.
+
+        Returns:
+            Tuple of (start_time, finish_time, f_est, f_actual, comp_energy, p_out).
+        """
+        if action == 0:
+            f_est = self.device_estimated_power[device.id]
+            f_actual = device.compute_power
+            t_comp, e_comp = self.network_env.calculate_local_computation(
+                subtask.cpu_cycles, device.energy_coeff, f_est, f_actual
+            )
+            local_wait = self._compute_waiting_delay_local(device)
+            start_time = max(self.current_slot + local_wait, predecessor_ready_time)
+            finish_time = start_time + t_comp
+            self.local_finish_time[device.id] = finish_time
+            return start_time, finish_time, f_est, f_actual, e_comp, 0.0
+
+        server = self.servers[action - 1]
+        f_est = self.server_estimated_power[server.id]
+        f_actual = server.compute_power
+        t_comp, e_comp = self.network_env.calculate_edge_computation(
+            subtask.cpu_cycles, server.energy_coeff, f_est, f_actual
+        )
+        server_wait = self._compute_waiting_delay_server(server)
+        l_start, l_end = self.connection_windows[(device.id, server.id)]
+        start_time = max(self.current_slot + server_wait, predecessor_ready_time, l_start + 1e-9)
+        finish_time = start_time + t_comp
+        p_out = self.p_out_value if not (start_time > l_start and finish_time < l_end) else 0.0
+        self.server_finish_time[server.id] = finish_time
+        return start_time, finish_time, f_est, f_actual, e_comp, p_out
 
     def get_state_dim(self) -> int:
-        # Eq. (23): {f_loc, W_d, subtask features(C,D,R), priority sequence, F_edge, W_s, l_start, l_end}
-        return 6 + 4 * len(self.servers)
+        """Return the flattened state vector dimension.
 
-    def _update_connection_windows(self):
+        Returns:
+            State vector length for a single device.
+        """
+        # Eq. (23): {f_loc, W_d, subtask features(C,D,R), priority sequence, F_edge, W_s, l_start, l_end}
+        # Priority sequence is represented as a normalized full vector with one value per subtask.
+        subtask_count = 0
+        if self.task_dags:
+            first_dag = self.task_dags[next(iter(self.task_dags))]
+            subtask_count = len(first_dag.subtasks)
+        if subtask_count == 0:
+            subtask_count = 5  # project uses 5-stage KolektorSDD pipeline
+        return (2 + 3) + subtask_count + 4 * len(self.servers)
+
+    def _update_connection_windows(self) -> None:
+        """Recompute connection windows for every device-server pair."""
         self.connection_windows = {}
-        horizon = self.slot_duration * self.connection_lookahead_slots
-        dt = horizon / float(self.subslot_count * self.connection_lookahead_slots)
+        horizon = self.slot_duration
+        dt = self.slot_duration / float(self.subslot_count)
         for device in self.devices:
             for server in self.servers:
-                l_start: Optional[float] = None
-                l_end: Optional[float] = None
-                for k in range(self.subslot_count * self.connection_lookahead_slots + 1):
+                window_start: Optional[float] = None
+                window_end: Optional[float] = None
+                for k in range(self.subslot_count + 1):
                     t_rel = k * dt
                     loc = device.location + device.direction * device.speed_mps * t_rel
                     inside = np.linalg.norm(loc - server.location) <= server.coverage_radius
-                    if inside and l_start is None:
-                        l_start = self.current_slot + t_rel
-                    if (not inside) and l_start is not None:
-                        l_end = self.current_slot + t_rel
+                    if inside and window_start is None:
+                        window_start = self.current_slot + t_rel
+                    if (not inside) and window_start is not None:
+                        window_end = self.current_slot + t_rel
                         break
 
-                if l_start is None:
-                    l_start = self.current_slot + horizon
-                    l_end = self.current_slot + horizon
-                elif l_end is None:
-                    l_end = self.current_slot + horizon
-                self.connection_windows[(device.id, server.id)] = (l_start, l_end)
+                if window_start is None:
+                    window_start = self.current_slot + horizon
+                    window_end = self.current_slot + horizon
+                elif window_end is None:
+                    window_end = self.current_slot + horizon
+                self.connection_windows[(device.id, server.id)] = (window_start, window_end)
+
+    def _build_predetermined_paths(self) -> None:
+        """Initialize fixed mobility paths for industrial devices."""
+        if self.device_waypoints:
+            return
+        # 5 fixed rectangular routes from user-confirmed Fig.4 topology (2 robots per route).
+        rectangles = [
+            [np.array([10.0, 10.0]), np.array([10.0, 30.0]), np.array([30.0, 30.0]), np.array([30.0, 10.0])],
+            [np.array([70.0, 10.0]), np.array([40.0, 10.0]), np.array([40.0, 20.0]), np.array([70.0, 20.0])],
+            [np.array([40.0, 20.0]), np.array([40.0, 50.0]), np.array([60.0, 50.0]), np.array([60.0, 20.0])],
+            [np.array([70.0, 10.0]), np.array([70.0, 40.0]), np.array([90.0, 40.0]), np.array([90.0, 10.0])],
+            [np.array([65.0, 45.0]), np.array([65.0, 55.0]), np.array([90.0, 55.0]), np.array([90.0, 45.0])],
+        ]
+        for device_index, device in enumerate(self.devices):
+            route_index = device_index // 2
+            route = [
+                np.clip(point.copy(), self.world_min, self.world_max)
+                for point in rectangles[route_index]
+            ]
+            route.append(route[0].copy())
+            self.device_waypoints[device.id] = route
+            # Two robots on same rectangle start from different corners.
+            self.device_waypoint_idx[device.id] = 0 if (device_index % 2 == 0) else 2
+
+    def _move_device_on_path(self, device: IndustrialDevice, elapsed: float) -> None:
+        """Move a device along its path for the given elapsed time.
+
+        Args:
+            device: Device to move.
+            elapsed: Elapsed time in seconds.
+        """
+        remaining = elapsed
+        waypoints = self.device_waypoints[device.id]
+        waypoint_index = self.device_waypoint_idx[device.id]
+        pos = device.location.copy()
+        speed = max(device.speed_mps, 1e-9)
+
+        while remaining > 0:
+            target_index = (waypoint_index + 1) % len(waypoints)
+            target = waypoints[target_index]
+            vec = target - pos
+            dist = np.linalg.norm(vec)
+
+            if dist < 1e-9:
+                waypoint_index = target_index
+                continue
+
+            dir_vec = vec / dist
+            travel = min(dist, speed * remaining)
+            pos = pos + dir_vec * travel
+            remaining -= travel / speed
+
+            if travel >= dist - 1e-9:
+                waypoint_index = target_index
+            else:
+                break
+
+        device.update_location(np.clip(pos, self.world_min, self.world_max))
+        self.device_waypoint_idx[device.id] = waypoint_index
+        next_index = (waypoint_index + 1) % len(waypoints)
+        device.set_direction(waypoints[next_index] - device.location)
 
     def _sample_estimated_power(self, actual_power: float, error_ratio: float) -> float:
+        """Return a noisy estimate of computing power.
+
+        Args:
+            actual_power: Actual computing power.
+            error_ratio: Relative estimation error.
+
+        Returns:
+            Estimated computing power.
+        """
         if error_ratio == 0.0:
             return actual_power
         noise = np.random.uniform(-error_ratio, error_ratio)
@@ -230,45 +739,98 @@ class DITENEnv:
         return max(1e-9, estimated)
 
     def _compute_waiting_delay_local(self, device: IndustrialDevice) -> float:
+        """Return queueing delay at the local device.
+
+        Args:
+            device: Device whose local queue is measured.
+
+        Returns:
+            Waiting delay in seconds.
+        """
         # Eq. (7): queueing delay at local node
         return max(0.0, self.local_finish_time[device.id] - self.current_slot)
 
     def _compute_waiting_delay_server(self, server: EdgeServer) -> float:
+        """Return queueing delay at the edge server.
+
+        Args:
+            server: Edge server whose queue is measured.
+
+        Returns:
+            Waiting delay in seconds.
+        """
         # Eq. (12): queueing delay at edge server
         return max(0.0, self.server_finish_time[server.id] - self.current_slot)
 
     def _get_joint_state(self) -> np.ndarray:
+        """Build the normalized joint state vector for all devices.
+
+        Returns:
+            Joint state array shaped (num_devices, state_dim).
+        """
         joint_state = []
         for device in self.devices:
             task_dag = self.task_dags[device.id]
-            state_step = min(self.current_step, len(self.priorities[device.id]) - 1)
+            state_step = min(self.current_step[device.id], len(self.priorities[device.id]) - 1)
             current_subtask_id = self.priorities[device.id][state_step]
             subtask = task_dag.subtasks[current_subtask_id]
 
-            f_loc = self.device_estimated_power[device.id] / 1e9
-            w_d = self._compute_waiting_delay_local(device) / max(self.slot_duration, 1e-6)
-            c_norm = subtask.cpu_cycles / 1e9
-            d_norm = subtask.data_size / 1e6
-            r_norm = subtask.result_size / 1e6
-            priority_norm = (self.current_step + 1) / max(len(task_dag.subtasks), 1)
-            edge_f = [self.server_estimated_power[server.id] / 1e9 for server in self.servers]
-            edge_w = [
+            local_power_norm = self.device_estimated_power[device.id] / 1e9
+            local_wait_norm = self._compute_waiting_delay_local(device) / max(self.slot_duration, 1e-6)
+            cpu_norm = subtask.cpu_cycles / 1e9
+            data_norm = subtask.data_size / 1e6
+            result_norm = subtask.result_size / 1e6
+            # Paper Eq.(23) uses priority information R_di^t. We encode this as
+            # a normalized per-subtask rank vector over the full priority sequence.
+            priority_order = self.priorities[device.id]
+            total_subtasks = max(len(priority_order), 1)
+            priority_rank = {
+                sid: rank for rank, sid in enumerate(priority_order, start=1)
+            }
+            priority_vector = [
+                priority_rank.get(subtask_id, total_subtasks) / total_subtasks
+                for subtask_id in sorted(task_dag.subtasks.keys())
+            ]
+            edge_power_norm = [self.server_estimated_power[server.id] / 1e9 for server in self.servers]
+            edge_wait_norm = [
                 self._compute_waiting_delay_server(server) / max(self.slot_duration, 1e-6)
                 for server in self.servers
             ]
-            l_starts = []
-            l_ends = []
+            window_starts = []
+            window_ends = []
+            horizon = self.slot_duration
             for server in self.servers:
                 l_start, l_end = self.connection_windows[(device.id, server.id)]
-                horizon = self.slot_duration * self.connection_lookahead_slots
-                l_starts.append((l_start - self.current_slot) / max(horizon, 1e-6))
-                l_ends.append((l_end - self.current_slot) / max(horizon, 1e-6))
+                window_starts.append((l_start - self.current_slot) / max(horizon, 1e-6))
+                window_ends.append((l_end - self.current_slot) / max(horizon, 1e-6))
 
-            state_vector = [f_loc, w_d, c_norm, d_norm, r_norm, priority_norm] + edge_f + edge_w + l_starts + l_ends
+            state_vector = (
+                [local_power_norm, local_wait_norm, cpu_norm, data_norm, result_norm]
+                + priority_vector
+                + edge_power_norm
+                + edge_wait_norm
+                + window_starts
+                + window_ends
+            )
             joint_state.append(state_vector)
         return np.array(joint_state, dtype=np.float32)
 
-    def _calculate_reward(self, t_im, e_im, t_accm, e_accm, p_out, task_dag) -> float:
+    def _calculate_reward(
+        self, t_im: float, e_im: float, t_accm: float, e_accm: float, p_out: float, task_dag: TaskDAG
+    ) -> float:
+        """Compute reward per Equation (24).
+
+        Args:
+            t_im: Immediate processing delay.
+            e_im: Immediate energy consumption.
+            t_accm: Accumulated delay in the slot.
+            e_accm: Accumulated energy in the slot.
+            p_out: Connection window penalty.
+            task_dag: Task DAG with t_max and e_max.
+
+        Returns:
+            Reward value.
+        """
         # Eq. (24)
         t_max = task_dag.t_max
         e_max = task_dag.e_max

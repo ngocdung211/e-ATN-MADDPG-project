@@ -1,12 +1,22 @@
+"""Plotting utilities for comparison experiments."""
+
+import os
+from typing import Dict, List
+
 import matplotlib.pyplot as plt
 import numpy as np
-import os
 
 class DITENPlotter2:
-    def __init__(self, save_dir="plots"):
-        self.save_dir = save_dir
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
+    """Plot comparison curves with paper-aligned styles."""
+
+    def __init__(self, save_dir: str = "plots"):
+        """Initialize the plotter.
+
+        Args:
+            save_dir: Output directory for saved plots.
+        """
+        self.save_dir: str = save_dir
+        os.makedirs(self.save_dir, exist_ok=True)
             
         # Hardcoded styles to match the distinct lines in the paper's figures
         self.styles = {
@@ -18,10 +28,16 @@ class DITENPlotter2:
             "e-ATN-MADDPG": {"color": "#d62728", "marker": "*"}   # Red, Star (Proposed)
         }
 
-    def plot_training_curve(self, data_dict, title, ylabel, filename):
-        """
-        Plots multiple training curves on the same chart from a dictionary.
-        data_dict format: {"Algorithm Name": [list_of_values]}
+    def plot_training_curve(
+        self, data_dict: Dict[str, List[float]], title: str, ylabel: str, filename: str
+    ) -> None:
+        """Plot multiple training curves on the same chart.
+
+        Args:
+            data_dict: Mapping of algorithm names to metric histories.
+            title: Plot title.
+            ylabel: Y-axis label.
+            filename: Output filename.
         """
         plt.figure(figsize=(10, 6))
         
@@ -32,7 +48,7 @@ class DITENPlotter2:
             style = self.styles.get(algo_name, {"color": None, "marker": None})
             
             # Space out the markers so they are legible (e.g., plot a marker every 20 episodes)
-            markevery = max(1, len(data) // 50)
+            markevery = max(1, len(data) // 100)
             
             plt.plot(
                 episodes, 
@@ -41,9 +57,9 @@ class DITENPlotter2:
                 color=style["color"], 
                 marker=style["marker"], 
                 markevery=markevery,
-                linewidth=1.2,
+                linewidth=1.4,
                 markersize=6,
-                alpha=0.8 # Slight transparency to see overlapping lines
+                alpha=0.9 # Slight transparency to see overlapping lines
             )
 
         # Formatting matching standard IEEE plots

@@ -1,11 +1,12 @@
-from typing import List, Dict
+"""Train and evaluate e-ATN-MADDPG on the DITEN environment."""
+
+from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from ultils.graph_ultils import extract_gcn_inputs
-from environment.system_model import TaskDAG, Subtask
 import time
+from tqdm import trange
 
 # Sửa lại import theo đúng cấu trúc thư mục
 from environment.network_env import NetworkEnvironment
@@ -16,36 +17,100 @@ from models.maddpg import EpsilonATNMADDPGAgent
 from models.gcn import TaskPriorityGCN
 from dataset.data_loader import KolektorSDDLoader
 from ultils.plotter import DITENPlotter
+from ultils.gcn_training import load_or_train_gcn
+from ultils.experiment_setup import build_priorities, generate_task_dags_for_episode, make_gcn_dag_sampler
 
 import random
 
-def set_seed(seed=42):
+def set_seed(seed: int = 42) -> None:
+    """Set random seeds for reproducible runs.
+
+    Args:
+        seed: Random seed value.
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
 
-#update 12:20 2026-05-04
+def _collect_joint_actions(
+    agents: Sequence[EpsilonATNMADDPGAgent], joint_state: np.ndarray
+) -> List[int]:
+    """Select one action per agent based on the current joint state.
 
-def generate_task_dags_for_episode(devices, data_loader: KolektorSDDLoader):
-    """ Hàm phụ trợ: Sinh TaskDAG thực tế từ ảnh Dataset cho từng thiết bị """
-    task_dags = {}
-    for device in devices:
-        task_params = data_loader.get_random_task_parameters()
-        task_dag = TaskDAG(task_id=device.id, t_max=1.0, e_max=1.0)
-        
-        for i in range(1, 6):
-            params = task_params[f"subtask_{i}"]
-            task_dag.add_subtask(Subtask(i, params["cpu_cycles"], params["data_size"], params["result_size"]))
-            
-        # Thêm Edge phụ thuộc (DAG topology)
-        task_dag.add_dependency(1, 2)
-        task_dag.add_dependency(1, 3)
-        task_dag.add_dependency(2, 4)
-        task_dag.add_dependency(3, 4)
-        task_dag.add_dependency(4, 5)
-        
-        task_dags[device.id] = task_dag
-    return task_dags
+    Args:
+        agents: Agents selecting actions.
+        joint_state: Joint state array shaped (num_agents, state_dim).
+
+    Returns:
+        List of integer actions, one per agent.
+    """
+    joint_actions: List[int] = []
+    for agent_index, agent in enumerate(agents):
+        agent_state = torch.FloatTensor(joint_state[agent_index])
+        action = agent.select_action(agent_state)
+        joint_actions.append(action)
+    return joint_actions
+
+
+def _update_agents_from_buffer(
+    agents: Sequence[EpsilonATNMADDPGAgent],
+    replay_buffer: MultiAgentReplayBuffer,
+    batch_size: int,
+    gamma: float,
+) -> None:
+    """Update agents from replay buffer samples when enough data is available.
+
+    Args:
+        agents: Agents to update.
+        replay_buffer: Shared multi-agent replay buffer.
+        batch_size: Batch size for sampling.
+        gamma: Discount factor.
+    """
+    if len(replay_buffer) < batch_size:
+        return
+
+    for agent_index, agent in enumerate(agents):
+        state_b, action_b, reward_b, next_state_b = replay_buffer.sample(batch_size)
+        agent_rewards = reward_b[:, agent_index].unsqueeze(1)
+        action_dim = agent.action_dim
+        action_b_onehot = F.one_hot(action_b.long(), num_classes=action_dim).float()
+
+        with torch.no_grad():
+            target_joint_action_idx = torch.stack(
+                [
+                    torch.argmax(a.target_actor(next_state_b[:, j, :]), dim=1)
+                    for j, a in enumerate(agents)
+                ],
+                dim=1,
+            )
+            target_joint_actions = F.one_hot(
+                target_joint_action_idx.long(), num_classes=action_dim
+            ).float()
+            target_q = agent.target_critic(next_state_b, target_joint_actions)
+            y_i = agent_rewards + gamma * target_q
+
+        current_q = agent.critic(state_b, action_b_onehot)
+        critic_loss = F.mse_loss(current_q, y_i)
+        agent.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        agent.critic_optimizer.step()
+
+        predicted_action_idx = torch.argmax(agent.actor(state_b[:, agent_index, :]), dim=1)
+        predicted_actions = F.one_hot(
+            predicted_action_idx.long(), num_classes=action_dim
+        ).float()
+        predicted_joint_actions = action_b_onehot.clone()
+        predicted_joint_actions[:, agent_index] = predicted_actions
+
+        actor_loss = -agent.critic(state_b, predicted_joint_actions).mean()
+        agent.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        agent.actor_optimizer.step()
+
+        agent.soft_update(agent.target_actor, agent.actor)
+        agent.soft_update(agent.target_critic, agent.critic)
+        agent.update_epsilon()
+
 
 def train_maddpg(
     agents: List[EpsilonATNMADDPGAgent],
@@ -54,83 +119,87 @@ def train_maddpg(
     replay_buffer: MultiAgentReplayBuffer,
     gcn_model: TaskPriorityGCN,
     data_loader: KolektorSDDLoader,
-    num_episodes=2000,
-    batch_size=64,
-    gamma=0.99,
-):
+    num_episodes: int = 2000,
+    batch_size: int = 64,
+    gamma: float = 0.99,
+    time_slots: int = 50,
+) -> Dict[str, List[float]]:
+    """Train e-ATN-MADDPG and return reward, delay, and energy histories.
+
+    Args:
+        agents: Multi-agent policy set.
+        devices: Industrial devices for the episode.
+        env: DITEN environment instance.
+        replay_buffer: Shared replay buffer for experience sampling.
+        gcn_model: TaskPriorityGCN for priority extraction.
+        data_loader: Dataset loader for task generation.
+        num_episodes: Number of episodes to train.
+        batch_size: Batch size for replay sampling.
+        gamma: Discount factor.
+        time_slots: Time slots per episode.
+
+    Returns:
+        Dict with reward, delay, and energy histories.
+    """
     num_agents = len(agents)
     history = {"reward": [], "delay": [], "energy": []}
-    
-    for episode in range(num_episodes):
-        # 1. Sinh task cho episode này
-        task_dags = generate_task_dags_for_episode(devices, data_loader)
-        
-        # 2. CHẠY GCN ĐỂ TÌM THỨ TỰ ƯU TIÊN (PRIORITIES)
-        priorities = {}
-        for device_id, task_dag in task_dags.items():
-            X, A = extract_gcn_inputs(task_dag)
-            with torch.no_grad():
-                scores = gcn_model(X, A)
-            
-            # Sắp xếp index subtask (từ 1 đến 5) dựa trên điểm score giảm dần
-            sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
-            priorities[device_id] = [idx + 1 for idx in sorted_indices]
-            
-        # 3. Reset Env với Task và Priorities vừa sinh
-        current_joint_state = env.reset(task_dags, priorities) 
+
+    episode_iterator = trange(num_episodes, desc="Training e-ATN-MADDPG", leave=True)
+    for episode in episode_iterator:
+        env.reset_episode()
         done = False
-        episode_reward = 0
-        
-        while not done:
-            joint_actions = []
-            for i, agent in enumerate(agents):
-                agent_state = torch.FloatTensor(current_joint_state[i])
-                action = agent.select_action(agent_state)
-                joint_actions.append(action)
-                
-            next_joint_state, joint_rewards, done, _ = env.step(joint_actions)
-            #TODO The contribution of each agent's need to be weighted. Should improve the reward function
-            episode_reward += sum(joint_rewards) / num_agents
-            
-            replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
-            current_joint_state = next_joint_state
-        
-        if len(replay_buffer) >= batch_size:
-            for i, agent in enumerate(agents):
-                state_b, action_b, reward_b, next_state_b = replay_buffer.sample(batch_size)
-                agent_rewards = reward_b[:, i].unsqueeze(1)
-                action_dim = agent.action_dim
-                action_b_onehot = F.one_hot(action_b.long(), num_classes=action_dim).float()
+        slot_rewards = []
+        slot_delays = []
+        slot_energies = []
 
-                with torch.no_grad():
-                    target_joint_actions = torch.stack([a.target_actor(next_state_b[:, j, :]) for j, a in enumerate(agents)], dim=1)
-                    target_q = agent.target_critic(next_state_b, target_joint_actions)
-                    y_i = agent_rewards + gamma * target_q
-                
-                current_q = agent.critic(state_b, action_b_onehot)
-                critic_loss = F.mse_loss(current_q, y_i)
-                agent.critic_optimizer.zero_grad()
-                critic_loss.backward()
-                agent.critic_optimizer.step()
-                
-                predicted_actions = agent.actor(state_b[:, i, :])
-                predicted_joint_actions = action_b_onehot.clone()
-                predicted_joint_actions[:, i] = predicted_actions
-                
-                actor_loss = -agent.critic(state_b, predicted_joint_actions).mean()
-                agent.actor_optimizer.zero_grad()
-                actor_loss.backward()
-                agent.actor_optimizer.step()
-                
-                agent.soft_update(agent.target_actor, agent.actor)
-                agent.soft_update(agent.target_critic, agent.critic)
-                agent.update_epsilon()
+        for _ in range(time_slots):
+            slot_reward = 0.0
+            slot_steps = 0
+            prev_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
+            prev_energy_mean = np.mean(list(env.device_accumulated_energy.values()))
+            task_dags = generate_task_dags_for_episode(devices, data_loader)
+            priorities = build_priorities(task_dags, gcn_model)
 
-        history["reward"].append(episode_reward)
-        history["delay"].append(np.mean(list(env.device_accumulated_delay.values())))
-        history["energy"].append(np.mean(list(env.device_accumulated_energy.values())))
+            current_joint_state = env.start_time_slot(task_dags, priorities)
+            slot_done = False
+            while not slot_done and not done:
+                joint_actions = _collect_joint_actions(agents, current_joint_state)
+
+                next_joint_state, joint_rewards, done, info = env.step(joint_actions)
+                slot_done = info.get("slot_done", False)
+                # Aggregate team reward as average per-agent immediate reward.
+                step_reward = sum(joint_rewards) / num_agents
+                slot_reward += step_reward
+                slot_steps += 1
+
+                replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
+                current_joint_state = next_joint_state
+
+            current_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
+            current_energy_mean = np.mean(list(env.device_accumulated_energy.values()))
+            slot_rewards.append(slot_reward / max(slot_steps, 1))
+            slot_delays.append(max(0.0, current_delay_mean - prev_delay_mean))
+            slot_energies.append(max(0.0, current_energy_mean - prev_energy_mean))
+
+        episode_avg_reward = float(np.mean(slot_rewards)) if slot_rewards else 0.0
+        episode_avg_delay = float(np.mean(slot_delays)) if slot_delays else 0.0
+        episode_avg_energy = float(np.mean(slot_energies)) if slot_energies else 0.0
+        history["reward"].append(episode_avg_reward)
+        history["delay"].append(episode_avg_delay)
+        history["energy"].append(episode_avg_energy)
+        episode_iterator.set_postfix(
+            reward=f"{episode_avg_reward:.3f}",
+            delay=f"{episode_avg_delay:.3f}s",
+            energy=f"{episode_avg_energy:.3f}J",
+        )
+        
+        _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
+
         if (episode + 1) % 10 == 0:
-            print(f"Episode {episode + 1}/{num_episodes} - Avg Reward: {episode_reward:.4f}")
+            print(
+                f"Ep {episode + 1}/{num_episodes} | Avg Reward/Slot: {history['reward'][-1]:.3f} "
+                f"| Delay: {history['delay'][-1]:.3f}s | Energy: {history['energy'][-1]:.3f}J"
+            )
             
     return history
 # ==========================================
@@ -148,35 +217,58 @@ if __name__ == "__main__":
     
     network_env = NetworkEnvironment(bandwidth=BANDWIDTH, noise_power_dbm=NOISE_POWER)
     
-    # 2. Khởi tạo Edge Servers
+    # 2. Khởi tạo Edge Servers (User-confirmed Fig.4 topology)
+    server_locations = [np.array([20.0, 30.0]), np.array([45.0, 50.0]), np.array([70.0, 20.0])]
     servers = []
-    for j in range(NUM_SERVERS):
-        f_edge = np.random.uniform(2.3, 2.5) * 1e9  # [2.3, 2.5] GHz
+    for server_index in range(NUM_SERVERS):
+        edge_power_hz = np.random.uniform(2.3, 2.5) * 1e9  # [2.3, 2.5] GHz
         server = EdgeServer(
-            server_id=j+1,
-            location=np.array([np.random.uniform(20, 80), np.random.uniform(20, 80)]),
-            compute_power=f_edge,
+            server_id=server_index + 1,
+            location=server_locations[server_index],
+            compute_power=edge_power_hz,
             transmit_power=1.2,                     # 1.2 W
             energy_coeff=1e-27,                     # \tau_j^{edge} = 10^-27
             coverage_radius=12
         )
         servers.append(server)
 
-    # 3. Khởi tạo Industrial Devices
+    # 3. Khởi tạo Industrial Devices (2 robots share each fixed rectangle)
+    robot_starts = [
+        np.array([10.0, 10.0]), np.array([30.0, 30.0]),
+        np.array([70.0, 10.0]), np.array([40.0, 20.0]),
+        np.array([40.0, 20.0]), np.array([60.0, 50.0]),
+        np.array([70.0, 10.0]), np.array([90.0, 40.0]),
+        np.array([65.0, 45.0]), np.array([90.0, 55.0]),
+    ]
     devices = []
-    for i in range(NUM_DEVICES):
-        f_loc = np.random.uniform(0.8, 1.2) * 1e9   # [0.8, 1.2] GHz
+    for device_index in range(NUM_DEVICES):
+        local_power_hz = np.random.uniform(0.8, 1.2) * 1e9   # [0.8, 1.2] GHz
         device = IndustrialDevice(
-            device_id=i+1,
-            location=np.array([np.random.uniform(0, 100), np.random.uniform(0, 100)]),
-            compute_power=f_loc,
+            device_id=device_index + 1,
+            location=robot_starts[device_index],
+            compute_power=local_power_hz,
             transmit_power=0.5,                     # 0.5 W
             energy_coeff=1e-28                      # \tau_i^{loc} = 10^-28
         )
         devices.append(device)
         
     # 4. Khởi tạo DITEN Environment
-    env = DITENEnv(devices, servers, network_env, slot_duration=1.0, subslot_count=100)
+    env = DITENEnv(
+        devices,
+        servers,
+        network_env,
+        slot_duration=1.0,
+        subslot_count=200,
+        time_slots=TIME_SLOTS,
+        lambda1=1.4,
+        lambda2=0.1,
+        lambda3=0.8,
+        lambda4=0.4,
+        lambda5=0.7,
+        p_out_value=-0.7,
+        local_estimation_error=0.2,
+        edge_estimation_error=0.0,
+    )
     # 5. Khởi tạo DRL Agents (\epsilon-ATN-MADDPG)
     # Xác định kích thước State và Action
     STATE_DIM = env.get_state_dim()
@@ -194,13 +286,23 @@ if __name__ == "__main__":
         )
         agents.append(agent)
 
-    # Khởi tạo GCN và Replay Buffer
-    # TODO: Have not train and show the inportance of the task.
-    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
-    replay_buffer = MultiAgentReplayBuffer(capacity=100000)
-    
     # Khởi tạo Data Loader
     data_loader = KolektorSDDLoader(dataset_path="dataset/KolektorSDD/")
+
+    # Khởi tạo GCN và Replay Buffer
+    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
+    gcn_ckpt_path = "models/checkpoints/gcn_priority.pt"
+    sample_training_dag = make_gcn_dag_sampler(data_loader)
+
+    gcn_model = load_or_train_gcn(
+        gcn_model=gcn_model,
+        dag_sampler=sample_training_dag,
+        checkpoint_path=gcn_ckpt_path,
+        epochs=200,
+        samples_per_epoch=32,
+        lr=0.01,
+    )
+    replay_buffer = MultiAgentReplayBuffer(capacity=100000)
     
     # 6. Bắt đầu Huấn Luyện
     print("\nStarting Training (e-ATN-MADDPG)...")
@@ -213,6 +315,7 @@ if __name__ == "__main__":
         replay_buffer=replay_buffer, 
         gcn_model=gcn_model,
         num_episodes=EPISODES,
+        time_slots=TIME_SLOTS,
         data_loader=data_loader,
         batch_size=64
     )
