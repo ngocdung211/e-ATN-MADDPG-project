@@ -19,6 +19,7 @@ from dataset.data_loader import KolektorSDDLoader
 from ultils.plotter import DITENPlotter
 from ultils.gcn_training import load_or_train_gcn
 from ultils.experiment_setup import build_priorities, generate_task_dags_for_episode, make_gcn_dag_sampler
+from ultils.paper_config import PAPER_PARAMS
 
 import random
 
@@ -147,12 +148,14 @@ def train_maddpg(
     episode_iterator = trange(num_episodes, desc="Training e-ATN-MADDPG", leave=True)
     for episode in episode_iterator:
         env.reset_episode()
-        done = False
+        episode_done = False
         slot_rewards = []
         slot_delays = []
         slot_energies = []
 
         for _ in range(time_slots):
+            if episode_done:
+                break
             slot_reward = 0.0
             slot_steps = 0
             prev_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
@@ -162,11 +165,12 @@ def train_maddpg(
 
             current_joint_state = env.start_time_slot(task_dags, priorities)
             slot_done = False
-            while not slot_done and not done:
+            while not slot_done and not episode_done:
                 joint_actions = _collect_joint_actions(agents, current_joint_state)
 
-                next_joint_state, joint_rewards, done, info = env.step(joint_actions)
+                next_joint_state, joint_rewards, step_episode_done, info = env.step(joint_actions)
                 slot_done = info.get("slot_done", False)
+                episode_done = step_episode_done
                 # Aggregate team reward as average per-agent immediate reward.
                 step_reward = sum(joint_rewards) / num_agents
                 slot_reward += step_reward
@@ -209,11 +213,13 @@ if __name__ == "__main__":
     print("Initializing Simulation Environment...")
     set_seed(42)  # Đảm bảo tính tái lập
     # 1. Cài đặt thông số mạng (Dựa theo Table II của bài báo)
-    BANDWIDTH = 10e6        # 10 MHz
-    NOISE_POWER = -43       # -43 dBm
-    NUM_DEVICES = 10        # 10 thiết bị
-    NUM_SERVERS = 3         # 3 Edge Servers
-    TIME_SLOTS = 50         # Số time slot trong mỗi episode
+    confirmed = PAPER_PARAMS["confirmed"]
+    provisional = PAPER_PARAMS["provisional_table2_needed"]
+    BANDWIDTH = confirmed["bandwidth_hz"]       # 10 MHz
+    NOISE_POWER = confirmed["noise_power_dbm"]  # -43 dBm
+    NUM_DEVICES = int(confirmed["num_devices"])
+    NUM_SERVERS = int(confirmed["num_servers"])
+    TIME_SLOTS = int(confirmed["time_slots"])
     
     network_env = NetworkEnvironment(bandwidth=BANDWIDTH, noise_power_dbm=NOISE_POWER)
     
@@ -226,9 +232,9 @@ if __name__ == "__main__":
             server_id=server_index + 1,
             location=server_locations[server_index],
             compute_power=edge_power_hz,
-            transmit_power=1.2,                     # 1.2 W
-            energy_coeff=1e-27,                     # \tau_j^{edge} = 10^-27
-            coverage_radius=12
+            transmit_power=confirmed["server_tx_power_w"],
+            energy_coeff=confirmed["server_energy_coeff"],
+            coverage_radius=confirmed["coverage_radius_m"],
         )
         servers.append(server)
 
@@ -247,8 +253,9 @@ if __name__ == "__main__":
             device_id=device_index + 1,
             location=robot_starts[device_index],
             compute_power=local_power_hz,
-            transmit_power=0.5,                     # 0.5 W
-            energy_coeff=1e-28                      # \tau_i^{loc} = 10^-28
+            transmit_power=confirmed["device_tx_power_w"],
+            energy_coeff=confirmed["device_energy_coeff"],
+            speed_mps=confirmed["device_speed_mps"],
         )
         devices.append(device)
         
@@ -257,7 +264,7 @@ if __name__ == "__main__":
         devices,
         servers,
         network_env,
-        slot_duration=1.0,
+        slot_duration=confirmed["slot_duration_s"],
         subslot_count=200,
         time_slots=TIME_SLOTS,
         lambda1=1.4,
@@ -282,7 +289,10 @@ if __name__ == "__main__":
             state_dim=STATE_DIM,
             action_dim=ACTION_DIM,
             num_agents=NUM_DEVICES,
-            lr=0.0001  # Learning rate tối ưu theo bài báo
+            lr=confirmed["rl_lr"],
+            epsilon_init=provisional["epsilon_init"],
+            epsilon_min=provisional["epsilon_min"],
+            decay=provisional["epsilon_decay"],
         )
         agents.append(agent)
 
@@ -290,7 +300,7 @@ if __name__ == "__main__":
     data_loader = KolektorSDDLoader(dataset_path="dataset/KolektorSDD/")
 
     # Khởi tạo GCN và Replay Buffer
-    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
+    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=int(confirmed["gcn_hidden_dim"]))
     gcn_ckpt_path = "models/checkpoints/gcn_priority.pt"
     sample_training_dag = make_gcn_dag_sampler(data_loader)
 
@@ -300,13 +310,13 @@ if __name__ == "__main__":
         checkpoint_path=gcn_ckpt_path,
         epochs=200,
         samples_per_epoch=32,
-        lr=0.01,
+        lr=confirmed["gcn_lr"],
     )
-    replay_buffer = MultiAgentReplayBuffer(capacity=100000)
+    replay_buffer = MultiAgentReplayBuffer(capacity=int(provisional["replay_buffer_capacity"]))
     
     # 6. Bắt đầu Huấn Luyện
     print("\nStarting Training (e-ATN-MADDPG)...")
-    EPISODES = 1000 # Theo bảng II
+    EPISODES = int(confirmed["train_episodes_full"])
     
     e_atn_history = train_maddpg(
         agents=agents, 
@@ -317,7 +327,8 @@ if __name__ == "__main__":
         num_episodes=EPISODES,
         time_slots=TIME_SLOTS,
         data_loader=data_loader,
-        batch_size=64
+        batch_size=int(provisional["batch_size"]),
+        gamma=provisional["gamma"],
     )
     
     # 7. Vẽ biểu đồ kết quả sau khi train xong

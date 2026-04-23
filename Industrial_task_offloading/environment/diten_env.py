@@ -23,7 +23,7 @@ class DITENEnv:
         lambda3: float = 1.0,
         lambda4: float = 1.0,
         lambda5: float = 0.5,
-        p_out_value: float = -1,
+        p_out_value: float = -1.0,
         local_estimation_error: float = 0.05,
         edge_estimation_error: float = 0.05,
         time_slots: int = 50,
@@ -312,6 +312,8 @@ class DITENEnv:
                 item["l_start"] = window_start
                 item["l_end"] = window_end
 
+            # Deterministic FIFO-like queue discipline by earliest feasible start
+            # (dependency-ready and link-available), then device id tie-break.
             group.sort(
                 key=lambda item: (
                     max(item["predecessor_ready_time"], item["l_start"] + 1e-9),
@@ -416,28 +418,6 @@ class DITENEnv:
             task_dag = item["task_dag"]
             current_subtask_id = item["subtask_id"]
 
-            if item.get("rejected"):
-                accum_delay = self.slot_accumulated_delay[device.id]
-                accum_energy = self.slot_accumulated_energy[device.id]
-                reward = self._calculate_reward(0.0, 0.0, accum_delay, accum_energy, item["p_out"], task_dag)
-                rewards.append(reward)
-                self.last_step_metrics.append(
-                    {
-                        "device_id": float(device.id),
-                        "subtask_id": float(current_subtask_id),
-                        "action": float(item.get("resolved_action", 0)),
-                        "f_est": float(item.get("f_est", 0.0)),
-                        "f_actual": float(item.get("f_actual", 0.0)),
-                        "delay": 0.0,
-                        "energy": 0.0,
-                        "tx_energy": float(item.get("tx_energy", 0.0)),
-                        "comp_energy": 0.0,
-                        "reward": float(reward),
-                        "p_out": float(item["p_out"]),
-                    }
-                )
-                continue
-
             instant_delay = max(0.0, item["finish_time"] - self.current_slot)
             instant_energy = item["tx_energy"] + item["e_comp"]
 
@@ -468,6 +448,7 @@ class DITENEnv:
                     "comp_energy": float(item["e_comp"]),
                     "reward": float(reward),
                     "p_out": float(item["p_out"]),
+                    "fallback_local": float(1.0 if item.get("rejected", False) else 0.0),
                 }
             )
 

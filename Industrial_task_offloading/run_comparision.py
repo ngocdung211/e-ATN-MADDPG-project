@@ -24,10 +24,10 @@ from dataset.data_loader import KolektorSDDLoader
 from models.replay_buffer import MultiAgentReplayBuffer
 from models.gcn import TaskPriorityGCN
 from models.maddpg import EpsilonATNMADDPGAgent
-from ultils.plotter import DITENPlotter
 from ultils.plotter2 import DITENPlotter2
 from ultils.gcn_training import load_or_train_gcn
 from ultils.experiment_setup import build_priorities, generate_task_dags_for_episode, make_gcn_dag_sampler
+from ultils.paper_config import PAPER_PARAMS
 import time
 
 
@@ -191,21 +191,23 @@ def train_algorithm(
     """
     print(f"\n{'='*50}\nStarting Training for: {algo_name}\n{'='*50}")
     set_seed(42)  # Reset seed for fair comparison
-    
-    time_slots = 50
+    confirmed = PAPER_PARAMS["confirmed"]
+    provisional = PAPER_PARAMS["provisional_table2_needed"]
+
+    time_slots = int(confirmed["time_slots"])
     env = DITENEnv(
         devices,
         servers,
         network_env,
-        slot_duration=1.0,
+        slot_duration=confirmed["slot_duration_s"],
         subslot_count=200,
         time_slots=time_slots,
-        lambda1=2,
-        lambda2=1,
-        lambda3=2,
-        lambda4=1,
+        lambda1=3,
+        lambda2=1.5,
+        lambda3=3,
+        lambda4=1.5,
         lambda5=1,
-        p_out_value=-4,
+        p_out_value=-5,
         local_estimation_error=0.2,
         edge_estimation_error=0.1,
     )
@@ -226,9 +228,9 @@ def train_algorithm(
         )
         agents.append(agent)
 
-    replay_buffer = MultiAgentReplayBuffer(capacity=100000)
-    batch_size = 64
-    gamma = 0.99
+    replay_buffer = MultiAgentReplayBuffer(capacity=int(provisional["replay_buffer_capacity"]))
+    batch_size = int(provisional["batch_size"])
+    gamma = provisional["gamma"]
     
     # Track metrics
     history = {"reward": [], "delay": [], "energy": [], "local_ratio": [], "edge_ratio": []}
@@ -242,8 +244,10 @@ def train_algorithm(
         slot_delays = []
         slot_energies = []
 
-        done = False
+        episode_done = False
         for _ in range(time_slots):
+            if episode_done:
+                break
             slot_reward = 0.0
             slot_local = 0
             slot_edge = 0
@@ -255,7 +259,7 @@ def train_algorithm(
 
             current_joint_state = env.start_time_slot(task_dags, priorities)
             slot_done = False
-            while not slot_done and not done:
+            while not slot_done and not episode_done:
                 joint_actions, local_count, edge_count = _collect_joint_actions(
                     agents, current_joint_state
                 )
@@ -264,8 +268,9 @@ def train_algorithm(
                 slot_local += local_count
                 slot_edge += edge_count
 
-                next_joint_state, joint_rewards, done, info = env.step(joint_actions)
+                next_joint_state, joint_rewards, step_episode_done, info = env.step(joint_actions)
                 slot_done = info.get("slot_done", False)
+                episode_done = step_episode_done
                 # Aggregate team reward as average per-agent immediate reward.
                 step_reward = sum(joint_rewards) / len(agents)
                 slot_reward += step_reward
@@ -323,8 +328,10 @@ def train_algorithm(
 
 if __name__ == "__main__":
     # 1. Base Environment Setup
-    BANDWIDTH, NOISE_POWER = 10e6, -43
-    NUM_DEVICES, NUM_SERVERS = 10, 3
+    confirmed = PAPER_PARAMS["confirmed"]
+    provisional = PAPER_PARAMS["provisional_table2_needed"]
+    BANDWIDTH, NOISE_POWER = confirmed["bandwidth_hz"], confirmed["noise_power_dbm"]
+    NUM_DEVICES, NUM_SERVERS = int(confirmed["num_devices"]), int(confirmed["num_servers"])
     
     network_env = NetworkEnvironment(bandwidth=BANDWIDTH, noise_power_dbm=NOISE_POWER)
     data_loader = KolektorSDDLoader(dataset_path="dataset/KolektorSDD/")
@@ -334,7 +341,7 @@ if __name__ == "__main__":
         f"(paper: 399; aligned={dataset_stats['is_paper_count_aligned']})"
     )
 
-    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=32)
+    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=int(confirmed["gcn_hidden_dim"]))
     gcn_ckpt_path = "models/checkpoints/gcn_priority.pt"
     sample_training_dag = make_gcn_dag_sampler(data_loader)
 
@@ -344,13 +351,20 @@ if __name__ == "__main__":
         checkpoint_path=gcn_ckpt_path,
         epochs=200,
         samples_per_epoch=32,
-        lr=0.01,
+        lr=confirmed["gcn_lr"],
     )
     
     # Fixed Edge Servers (User-confirmed Fig.4 topology)
     server_locations = [np.array([20.0, 30.0]), np.array([45.0, 50.0]), np.array([70.0, 20.0])]
     servers = [
-        EdgeServer(j+1, loc, np.random.uniform(2.3, 2.5)*1e9, 1.2, 1e-27, coverage_radius=12.0)
+        EdgeServer(
+            j + 1,
+            loc,
+            np.random.uniform(2.3, 2.5) * 1e9,
+            confirmed["server_tx_power_w"],
+            confirmed["server_energy_coeff"],
+            coverage_radius=confirmed["coverage_radius_m"],
+        )
         for j, loc in enumerate(server_locations)
     ]
 
@@ -363,7 +377,14 @@ if __name__ == "__main__":
         np.array([65.0, 45.0]), np.array([90.0, 55.0]),
     ]
     devices = [
-        IndustrialDevice(i+1, robot_starts[i], np.random.uniform(0.8, 1.2)*1e9, 0.5, 1e-28)
+        IndustrialDevice(
+            i + 1,
+            robot_starts[i],
+            np.random.uniform(0.8, 1.2) * 1e9,
+            confirmed["device_tx_power_w"],
+            confirmed["device_energy_coeff"],
+            speed_mps=confirmed["device_speed_mps"],
+        )
         for i in range(NUM_DEVICES)
     ]
 
@@ -371,22 +392,29 @@ if __name__ == "__main__":
     algorithms = {
         "e-ATN-MADDPG": {
             "class": EpsilonATNMADDPGAgent,
-            "kwargs": {"use_attention": True, "use_epsilon_greedy": True, "lr": 0.0001},
+            "kwargs": {
+                "use_attention": True,
+                "use_epsilon_greedy": True,
+                "lr": confirmed["rl_lr"],
+                "epsilon_init": provisional["epsilon_init"],
+                "epsilon_min": provisional["epsilon_min"],
+                "decay": provisional["epsilon_decay"],
+            },
         },
-        "MAAC": {"class": MAACAgent, "kwargs": {"lr": 0.0001}},
-        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": 0.0001}},
-        "MADDPG": {
-            "class": EpsilonATNMADDPGAgent,
-            "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001},
-        },
-        "GR-MADDPG": {
-            "class": EpsilonATNMADDPGAgent,
-            "kwargs": {"use_attention": False, "use_epsilon_greedy": True, "lr": 0.0001},
-        },
-        "ATN-MADDPG": {
-            "class": EpsilonATNMADDPGAgent,
-            "kwargs": {"use_attention": True, "use_epsilon_greedy": False, "lr": 0.0001},
-        },
+        "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        # "MADDPG": {
+        #     "class": EpsilonATNMADDPGAgent,
+        #     "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001},
+        # },
+        # "GR-MADDPG": {
+        #     "class": EpsilonATNMADDPGAgent,
+        #     "kwargs": {"use_attention": False, "use_epsilon_greedy": True, "lr": 0.0001},
+        # },
+        # "ATN-MADDPG": {
+        #     "class": EpsilonATNMADDPGAgent,
+        #     "kwargs": {"use_attention": True, "use_epsilon_greedy": False, "lr": 0.0001},
+        # },
  
     }
 
@@ -400,7 +428,14 @@ if __name__ == "__main__":
     # priority_modes = {"GCN Scheduling": "gcn"}
     e_atn_cfg = {
         "class": EpsilonATNMADDPGAgent,
-        "kwargs": {"use_attention": True, "use_epsilon_greedy": True, "lr": 0.0001},
+        "kwargs": {
+            "use_attention": True,
+            "use_epsilon_greedy": True,
+            "lr": confirmed["rl_lr"],
+            "epsilon_init": provisional["epsilon_init"],
+            "epsilon_min": provisional["epsilon_min"],
+            "decay": provisional["epsilon_decay"],
+        },
     }
     # for label, mode in priority_modes.items():
     #     history = train_algorithm(
