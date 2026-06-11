@@ -15,3 +15,5 @@ runs/
 outputs/
 dataset/KolektorSDD/
 plots/
+.agents/
+AGENTS.md
