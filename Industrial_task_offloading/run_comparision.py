@@ -15,6 +15,12 @@ import os
 from tqdm import trange
 from baselines.maac import MAACAgent
 from baselines.mappo import MAPPOAgent
+from baselines.offloading_baselines import (
+    EdgeOnlyAgent,
+    FeatureExtractionEdgeAgent,
+    LocalOnlyAgent,
+    RandomOffloadingAgent,
+)
 from baselines.scheduling_baselines import BaselineSchedulers
 # Environment & Models
 from environment.network_env import NetworkEnvironment
@@ -40,6 +46,36 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
+
+
+def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
+    """Build algorithm configurations for DRL and simple baselines.
+
+    Returns:
+        Mapping from display name to agent class and constructor kwargs.
+    """
+    confirmed = PAPER_PARAMS["confirmed"]
+    provisional = PAPER_PARAMS["provisional_table2_needed"]
+    return {
+        "Local Only": {"class": LocalOnlyAgent, "kwargs": {}},
+        "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
+        "Feature Extraction Edge": {"class": FeatureExtractionEdgeAgent, "kwargs": {}},
+        # "Random Offloading": {"class": RandomOffloadingAgent, "kwargs": {}},
+        "e-ATN-MADDPG": {
+            "class": EpsilonATNMADDPGAgent,
+            "kwargs": {
+                "use_attention": True,
+                "use_epsilon_greedy": True,
+                "lr": confirmed["rl_lr"],
+                "epsilon_init": provisional["epsilon_init"],
+                "epsilon_min": provisional["epsilon_min"],
+                "decay": provisional["epsilon_decay"],
+            },
+        },
+        # "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+
+    }
 
 
 def build_priorities_by_mode(
@@ -69,13 +105,14 @@ def build_priorities_by_mode(
 
 
 def _collect_joint_actions(
-    agents: Sequence[object], joint_state: np.ndarray
+    agents: Sequence[object], joint_state: np.ndarray, env: DITENEnv | None = None
 ) -> Tuple[List[int], int, int]:
     """Select joint actions and count local/edge choices.
 
     Args:
         agents: Agents selecting actions.
         joint_state: Joint state array shaped (num_agents, state_dim).
+        env: Optional environment for rule-based baselines that need subtask id.
 
     Returns:
         Tuple of (joint_actions, local_count, edge_count).
@@ -85,13 +122,100 @@ def _collect_joint_actions(
     edge_count = 0
     for agent_index, agent in enumerate(agents):
         agent_state = torch.FloatTensor(joint_state[agent_index])
-        action = agent.select_action(agent_state)
+        if env is not None and hasattr(agent, "select_action_for_subtask"):
+            device = env.devices[agent_index]
+            step_index = env.current_step[device.id]
+            priority_order = env.priorities.get(device.id, [])
+            subtask_id = priority_order[step_index] if step_index < len(priority_order) else -1
+            action = agent.select_action_for_subtask(agent_state, subtask_id)
+        else:
+            action = agent.select_action(agent_state)
         joint_actions.append(action)
         if action == 0:
             local_count += 1
         else:
             edge_count += 1
     return joint_actions, local_count, edge_count
+
+
+def _summarize_step_metrics(step_metrics: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    """Summarize timing diagnostics from environment step metrics.
+
+    Args:
+        step_metrics: Per-device metrics from `DITENEnv.last_step_metrics`.
+
+    Returns:
+        Aggregated timing diagnostics for the step.
+    """
+    summary = {
+        "local_time": 0.0,
+        "server_time": 0.0,
+        "attempted_server_time": 0.0,
+        "transfer_time": 0.0,
+        "queue_or_wait_time": 0.0,
+        "penalty_time": 0.0,
+        "penalty_count": 0.0,
+        "requested_local_count": 0.0,
+        "requested_edge_count": 0.0,
+        "resolved_local_count": 0.0,
+        "resolved_edge_count": 0.0,
+    }
+    for metric in step_metrics:
+        requested_action = int(metric.get("requested_action", -1.0))
+        resolved_action = int(metric.get("action", -1.0))
+        summary["local_time"] += float(metric.get("local_time", 0.0))
+        summary["server_time"] += float(metric.get("server_time", 0.0))
+        summary["attempted_server_time"] += float(metric.get("attempted_server_time", 0.0))
+        summary["transfer_time"] += float(metric.get("transfer_time", 0.0))
+        summary["queue_or_wait_time"] += float(metric.get("queue_or_wait_time", 0.0))
+        summary["penalty_time"] += float(metric.get("penalty_time", 0.0))
+        summary["penalty_count"] += float(metric.get("penalty_applied", 0.0))
+        if requested_action == 0:
+            summary["requested_local_count"] += 1.0
+        elif requested_action > 0:
+            summary["requested_edge_count"] += 1.0
+        if resolved_action == 0:
+            summary["resolved_local_count"] += 1.0
+        elif resolved_action > 0:
+            summary["resolved_edge_count"] += 1.0
+    return summary
+
+
+def _format_diagnostic_summary(algo_name: str, episode_number: int, history: Dict[str, List[float]]) -> str:
+    """Format timing diagnostics as a readable multi-line block.
+
+    Args:
+        algo_name: Algorithm display name.
+        episode_number: One-based episode number.
+        history: Metric history populated by `train_algorithm`.
+
+    Returns:
+        Human-readable diagnostic summary.
+    """
+    requested_local = history["requested_local_count"][-1]
+    requested_edge = history["requested_edge_count"][-1]
+    resolved_local = history["resolved_local_count"][-1]
+    resolved_edge = history["resolved_edge_count"][-1]
+    penalty_count = history["penalty_count"][-1]
+    penalty_time = history["penalty_time"][-1]
+    local_time = history["local_time"][-1]
+    server_time = history["server_time"][-1]
+    transfer_time = history["transfer_time"][-1]
+    wait_time = history["queue_or_wait_time"][-1]
+
+    return (
+        f"[{algo_name}] Episode {episode_number} diagnostics\n"
+        f"  Requested actions: local={requested_local:.0f} edge={requested_edge:.0f}\n"
+        f"  Actual execution:  local={resolved_local:.0f} edge={resolved_edge:.0f}\n"
+        f"  Penalties:         count={penalty_count:.0f} time={penalty_time:.3f}s\n"
+        f"  Timing avg/step:   local={local_time:.3f}s server={server_time:.3f}s "
+        f"transfer={transfer_time:.3f}s wait={wait_time:.3f}s"
+    )
+
+
+def _should_print_diagnostics(episode_number: int, num_episodes: int) -> bool:
+    """Return whether to print readable diagnostics for this episode."""
+    return episode_number == num_episodes or episode_number % 50 == 0
 
 
 def _update_agents_from_buffer(
@@ -143,10 +267,7 @@ def _update_agents_from_buffer(
             critic_loss.backward()
             agent.critic_optimizer.step()
 
-            predicted_action_idx = torch.argmax(agent.actor(state_b[:, agent_index, :]), dim=1)
-            predicted_actions = F.one_hot(
-                predicted_action_idx.long(), num_classes=action_dim
-            ).float()
+            predicted_actions = agent.actor(state_b[:, agent_index, :])
             predicted_joint_actions = action_b_onehot.clone()
             predicted_joint_actions[:, agent_index] = predicted_actions
 
@@ -170,7 +291,7 @@ def train_algorithm(
     network_env: NetworkEnvironment,
     data_loader: KolektorSDDLoader,
     gcn_model: TaskPriorityGCN,
-    num_episodes: int = 100,
+    num_episodes: int,
     priority_mode: str = "gcn",
 ) -> Dict[str, List[float]]:
     """Train one algorithm configuration and return metric histories.
@@ -202,12 +323,12 @@ def train_algorithm(
         slot_duration=confirmed["slot_duration_s"],
         subslot_count=200,
         time_slots=time_slots,
-        lambda1=3,
-        lambda2=1.5,
-        lambda3=3,
-        lambda4=1.5,
+        lambda1=1,
+        lambda2=2,
+        lambda3=1,
+        lambda4=2,
         lambda5=1,
-        p_out_value=-5,
+        p_out_value=-0.5,
         local_estimation_error=0.2,
         edge_estimation_error=0.1,
     )
@@ -233,7 +354,24 @@ def train_algorithm(
     gamma = provisional["gamma"]
     
     # Track metrics
-    history = {"reward": [], "delay": [], "energy": [], "local_ratio": [], "edge_ratio": []}
+    history = {
+        "reward": [],
+        "delay": [],
+        "energy": [],
+        "local_ratio": [],
+        "edge_ratio": [],
+        "local_time": [],
+        "server_time": [],
+        "attempted_server_time": [],
+        "transfer_time": [],
+        "queue_or_wait_time": [],
+        "penalty_time": [],
+        "penalty_count": [],
+        "requested_local_count": [],
+        "requested_edge_count": [],
+        "resolved_local_count": [],
+        "resolved_edge_count": [],
+    }
 
     episode_iterator = trange(num_episodes, desc=f"Training {algo_name}", leave=True)
     for episode in episode_iterator:
@@ -243,6 +381,17 @@ def train_algorithm(
         slot_rewards = []
         slot_delays = []
         slot_energies = []
+        slot_local_times = []
+        slot_server_times = []
+        slot_attempted_server_times = []
+        slot_transfer_times = []
+        slot_queue_or_wait_times = []
+        slot_penalty_times = []
+        slot_penalty_counts = []
+        slot_requested_local_counts = []
+        slot_requested_edge_counts = []
+        slot_resolved_local_counts = []
+        slot_resolved_edge_counts = []
 
         episode_done = False
         for _ in range(time_slots):
@@ -261,7 +410,7 @@ def train_algorithm(
             slot_done = False
             while not slot_done and not episode_done:
                 joint_actions, local_count, edge_count = _collect_joint_actions(
-                    agents, current_joint_state
+                    agents, current_joint_state, env
                 )
                 count_local += local_count
                 count_edge += edge_count
@@ -269,12 +418,24 @@ def train_algorithm(
                 slot_edge += edge_count
 
                 next_joint_state, joint_rewards, step_episode_done, info = env.step(joint_actions)
+                metric_summary = _summarize_step_metrics(env.last_step_metrics)
                 slot_done = info.get("slot_done", False)
                 episode_done = step_episode_done
                 # Aggregate team reward as average per-agent immediate reward.
                 step_reward = sum(joint_rewards) / len(agents)
                 slot_reward += step_reward
                 slot_steps += 1
+                slot_local_times.append(metric_summary["local_time"])
+                slot_server_times.append(metric_summary["server_time"])
+                slot_attempted_server_times.append(metric_summary["attempted_server_time"])
+                slot_transfer_times.append(metric_summary["transfer_time"])
+                slot_queue_or_wait_times.append(metric_summary["queue_or_wait_time"])
+                slot_penalty_times.append(metric_summary["penalty_time"])
+                slot_penalty_counts.append(metric_summary["penalty_count"])
+                slot_requested_local_counts.append(metric_summary["requested_local_count"])
+                slot_requested_edge_counts.append(metric_summary["requested_edge_count"])
+                slot_resolved_local_counts.append(metric_summary["resolved_local_count"])
+                slot_resolved_edge_counts.append(metric_summary["resolved_edge_count"])
                 replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
                 current_joint_state = next_joint_state
         
@@ -295,6 +456,29 @@ def train_algorithm(
         episode_avg_reward = float(np.mean(slot_rewards)) if slot_rewards else 0.0
         episode_avg_delay = float(np.mean(slot_delays)) if slot_delays else 0.0
         episode_avg_energy = float(np.mean(slot_energies)) if slot_energies else 0.0
+        episode_local_time = float(np.mean(slot_local_times)) if slot_local_times else 0.0
+        episode_server_time = float(np.mean(slot_server_times)) if slot_server_times else 0.0
+        episode_attempted_server_time = (
+            float(np.mean(slot_attempted_server_times)) if slot_attempted_server_times else 0.0
+        )
+        episode_transfer_time = float(np.mean(slot_transfer_times)) if slot_transfer_times else 0.0
+        episode_queue_or_wait_time = (
+            float(np.mean(slot_queue_or_wait_times)) if slot_queue_or_wait_times else 0.0
+        )
+        episode_penalty_time = float(np.mean(slot_penalty_times)) if slot_penalty_times else 0.0
+        episode_penalty_count = float(np.sum(slot_penalty_counts)) if slot_penalty_counts else 0.0
+        episode_requested_local_count = (
+            float(np.sum(slot_requested_local_counts)) if slot_requested_local_counts else 0.0
+        )
+        episode_requested_edge_count = (
+            float(np.sum(slot_requested_edge_counts)) if slot_requested_edge_counts else 0.0
+        )
+        episode_resolved_local_count = (
+            float(np.sum(slot_resolved_local_counts)) if slot_resolved_local_counts else 0.0
+        )
+        episode_resolved_edge_count = (
+            float(np.sum(slot_resolved_edge_counts)) if slot_resolved_edge_counts else 0.0
+        )
         total_actions = count_local + count_edge
         local_ratio = (count_local / total_actions * 100.0) if total_actions > 0 else 0.0
         edge_ratio = (count_edge / total_actions * 100.0) if total_actions > 0 else 0.0
@@ -304,24 +488,53 @@ def train_algorithm(
         history["energy"].append(episode_avg_energy)
         history["local_ratio"].append(local_ratio)
         history["edge_ratio"].append(edge_ratio)
+        history["local_time"].append(episode_local_time)
+        history["server_time"].append(episode_server_time)
+        history["attempted_server_time"].append(episode_attempted_server_time)
+        history["transfer_time"].append(episode_transfer_time)
+        history["queue_or_wait_time"].append(episode_queue_or_wait_time)
+        history["penalty_time"].append(episode_penalty_time)
+        history["penalty_count"].append(episode_penalty_count)
+        history["requested_local_count"].append(episode_requested_local_count)
+        history["requested_edge_count"].append(episode_requested_edge_count)
+        history["resolved_local_count"].append(episode_resolved_local_count)
+        history["resolved_edge_count"].append(episode_resolved_edge_count)
 
         episode_iterator.set_postfix(
             reward=f"{episode_avg_reward:.3f}",
             delay=f"{episode_avg_delay:.3f}s",
             energy=f"{episode_avg_energy:.3f}J",
+            actual=f"L{episode_resolved_local_count:.0f}/E{episode_resolved_edge_count:.0f}",
+            penalty=f"{episode_penalty_count:.0f}",
         )
+
+        episode_number = episode + 1
+        if _should_print_diagnostics(episode_number, num_episodes):
+            episode_iterator.write(_format_diagnostic_summary(algo_name, episode_number, history))
          
         # 4. Network Updates (Standard MADDPG logic)
         _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
     
-        if (episode + 1) % 50 == 0:
+        if episode_number % 50 == 0:
             print(
-                f"[{algo_name}] Ep {episode + 1}/{num_episodes} ----|--- Avg R/Slot: {history['reward'][-1]:.3f} "
+                f"[{algo_name}] Ep {episode_number}/{num_episodes} ----|--- Avg R/Slot: {history['reward'][-1]:.3f} "
                 f"---|--- D: {history['delay'][-1]:.3f}s ---|--- E: {history['energy'][-1]:.3f}J"
             )
             print(
                 f"[{algo_name}] Local ({count_local} / {history['local_ratio'][-1]:.1f}%) - "
                 f"Edge ({count_edge} / {history['edge_ratio'][-1]:.1f}%)"
+            )
+            print(
+                f"[{algo_name}] Timing | Local: {history['local_time'][-1]:.3f}s "
+                f"| Server: {history['server_time'][-1]:.3f}s "
+                f"| Transfer: {history['transfer_time'][-1]:.3f}s "
+                f"| Wait: {history['queue_or_wait_time'][-1]:.3f}s "
+                f"| Requested L/E: {history['requested_local_count'][-1]:.0f}/"
+                f"{history['requested_edge_count'][-1]:.0f} "
+                f"| Resolved L/E: {history['resolved_local_count'][-1]:.0f}/"
+                f"{history['resolved_edge_count'][-1]:.0f} "
+                f"| Penalty: {history['penalty_count'][-1]:.0f} / "
+                f"{history['penalty_time'][-1]:.3f}s"
             )
             
     return history
@@ -360,7 +573,7 @@ if __name__ == "__main__":
         EdgeServer(
             j + 1,
             loc,
-            np.random.uniform(2.3, 2.5) * 1e9,
+            np.random.uniform(3.3, 3.5) * 1e9,
             confirmed["server_tx_power_w"],
             confirmed["server_energy_coeff"],
             coverage_radius=confirmed["coverage_radius_m"],
@@ -389,54 +602,27 @@ if __name__ == "__main__":
     ]
 
     # 2. Define Algorithms to Compare
-    algorithms = {
-        "e-ATN-MADDPG": {
-            "class": EpsilonATNMADDPGAgent,
-            "kwargs": {
-                "use_attention": True,
-                "use_epsilon_greedy": True,
-                "lr": confirmed["rl_lr"],
-                "epsilon_init": provisional["epsilon_init"],
-                "epsilon_min": provisional["epsilon_min"],
-                "decay": provisional["epsilon_decay"],
-            },
-        },
-        "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
-        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
-        # "MADDPG": {
-        #     "class": EpsilonATNMADDPGAgent,
-        #     "kwargs": {"use_attention": False, "use_epsilon_greedy": False, "lr": 0.0001},
-        # },
-        # "GR-MADDPG": {
-        #     "class": EpsilonATNMADDPGAgent,
-        #     "kwargs": {"use_attention": False, "use_epsilon_greedy": True, "lr": 0.0001},
-        # },
-        # "ATN-MADDPG": {
-        #     "class": EpsilonATNMADDPGAgent,
-        #     "kwargs": {"use_attention": True, "use_epsilon_greedy": False, "lr": 0.0001},
-        # },
- 
-    }
+    algorithms = build_algorithm_configs()
 
     # 3. Run Comparisons
     results = {"reward": {}, "delay": {}, "energy": {}}
     priority_results = {"reward": {}, "delay": {}, "energy": {}}
-    EPISODES = 100 # Use a smaller number (e.g., 100) for testing
+    EPISODES = 10 # Use a smaller number (e.g., 100) for testing
 
     # Fig.6-style priority extraction comparison under fixed e-ATN-MADDPG.
     priority_modes = {"Random Scheduling": "random", "Greedy Scheduling": "greedy", "GCN Scheduling": "gcn"}
     # priority_modes = {"GCN Scheduling": "gcn"}
-    e_atn_cfg = {
-        "class": EpsilonATNMADDPGAgent,
-        "kwargs": {
-            "use_attention": True,
-            "use_epsilon_greedy": True,
-            "lr": confirmed["rl_lr"],
-            "epsilon_init": provisional["epsilon_init"],
-            "epsilon_min": provisional["epsilon_min"],
-            "decay": provisional["epsilon_decay"],
-        },
-    }
+    # e_atn_cfg = {
+    #     "class": EpsilonATNMADDPGAgent,
+    #     "kwargs": {
+    #         "use_attention": True,
+    #         "use_epsilon_greedy": True,
+    #         "lr": confirmed["rl_lr"],
+    #         "epsilon_init": provisional["epsilon_init"],
+    #         "epsilon_min": provisional["epsilon_min"],
+    #         "decay": provisional["epsilon_decay"],
+    #     },
+    # }
     # for label, mode in priority_modes.items():
     #     history = train_algorithm(
     #         f"e-ATN-MADDPG ({label})",

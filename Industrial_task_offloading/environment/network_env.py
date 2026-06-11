@@ -119,4 +119,5 @@ class NetworkEnvironment:
         # Energy consumption of edge computation
         energy_consumption = energy_coeff * cpu_cycles * (f_actual ** 2)
         
+        energy_consumption = 0 # --- IGNORE THIS LINE FOR NOW, SETTING EDGE COMPUTATION ENERGY TO ZERO FOR SIMPLICITY ---
         return actual_delay, energy_consumption

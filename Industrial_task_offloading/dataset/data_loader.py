@@ -65,32 +65,33 @@ class KolektorSDDLoader:
         
         # We model the data sizes (D), result sizes (R), and CPU cycles (C) 
         # proportionally based on the real image size and pixel count.
+        raw_bits = pixels * 8
         
         task_params = {
             "subtask_1": {  # Image Extraction
                 "data_size": file_size_bits,
-                "result_size": file_size_bits * 1.2,  # Uncompressed data
-                "cpu_cycles": pixels * 10,
+                "result_size": raw_bits,
+                "cpu_cycles": pixels * 25,
             },
             "subtask_2": {  # Image Denoising
-                "data_size": file_size_bits * 1.2,
-                "result_size": file_size_bits * 1.2,
-                "cpu_cycles": pixels * 50,  # Compute intensive filter
+                "data_size": raw_bits,
+                "result_size": raw_bits,
+                "cpu_cycles": pixels * 100,
             },
             "subtask_3": {  # Standardization
-                "data_size": file_size_bits * 1.2,
-                "result_size": file_size_bits * 0.8,  # Resizing/Cropping
-                "cpu_cycles": pixels * 20,
+                "data_size": raw_bits,
+                "result_size": raw_bits * 0.6,
+                "cpu_cycles": pixels * 50,
             },
-            "subtask_4": {  # Feature Extraction (e.g., passing through CNN layers)
-                "data_size": file_size_bits * 0.8,
-                "result_size": file_size_bits * 0.1,  # Vector representation
-                "cpu_cycles": pixels * 200,  # Highly compute intensive
+            "subtask_4": {  # Feature Extraction
+                "data_size": raw_bits * 0.6,
+                "result_size": file_size_bits * 0.1,
+                "cpu_cycles": pixels * 700,
             },
             "subtask_5": {  # Detection and Recognition
                 "data_size": file_size_bits * 0.1,
-                "result_size": 256,  # Small classification result/bounding box
-                "cpu_cycles": pixels * 50,
+                "result_size": 256,
+                "cpu_cycles": pixels * 150,
             },
         }
         

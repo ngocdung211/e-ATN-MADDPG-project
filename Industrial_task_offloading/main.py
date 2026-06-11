@@ -96,10 +96,7 @@ def _update_agents_from_buffer(
         critic_loss.backward()
         agent.critic_optimizer.step()
 
-        predicted_action_idx = torch.argmax(agent.actor(state_b[:, agent_index, :]), dim=1)
-        predicted_actions = F.one_hot(
-            predicted_action_idx.long(), num_classes=action_dim
-        ).float()
+        predicted_actions = agent.actor(state_b[:, agent_index, :])
         predicted_joint_actions = action_b_onehot.clone()
         predicted_joint_actions[:, agent_index] = predicted_actions
 

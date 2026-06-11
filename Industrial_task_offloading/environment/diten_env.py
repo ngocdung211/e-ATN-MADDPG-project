@@ -131,17 +131,36 @@ class DITENEnv:
         Returns:
             Joint state array for all devices.
         """
+        self._validate_priority_orders(task_dags, priorities)
         self.task_dags = task_dags
         self.priorities = priorities
         self.current_step = {d.id: 0 for d in self.devices}
 
         self.subtask_finish_times = {d.id: {} for d in self.devices}
         self.subtask_locations = {d.id: {} for d in self.devices}
-        self.local_finish_time = {d.id: 0.0 for d in self.devices}
-        self.server_finish_time = {s.id: 0.0 for s in self.servers}
+        # self.local_finish_time = {d.id: 0.0 for d in self.devices}
+        # self.server_finish_time = {s.id: 0.0 for s in self.servers}
         self.slot_accumulated_delay = {d.id: 0.0 for d in self.devices}
         self.slot_accumulated_energy = {d.id: 0.0 for d in self.devices}
+        slot_start = self.current_slot_index * self.slot_duration
+
+        if not self.local_finish_time:
+            self.local_finish_time = {d.id: slot_start for d in self.devices}
+        else:
+            self.local_finish_time = {
+                d.id: max(self.local_finish_time.get(d.id, slot_start), slot_start)
+                for d in self.devices
+            }
+
+        if not self.server_finish_time:
+            self.server_finish_time = {s.id: slot_start for s in self.servers}
+        else:
+            self.server_finish_time = {
+                s.id: max(self.server_finish_time.get(s.id, slot_start), slot_start)
+                for s in self.servers
+            }
         self.last_step_metrics = []
+
         self.device_estimated_power = {
             d.id: self._sample_estimated_power(d.compute_power, self.local_estimation_error) for d in self.devices
         }
@@ -151,6 +170,38 @@ class DITENEnv:
 
         self._update_connection_windows()
         return self._get_joint_state()
+
+    def _validate_priority_orders(
+        self, task_dags: Dict[int, TaskDAG], priorities: Dict[int, List[int]]
+    ) -> None:
+        """Validate that each priority order respects DAG dependencies.
+
+        Args:
+            task_dags: Mapping of device IDs to TaskDAG instances.
+            priorities: Mapping of device IDs to ordered subtask IDs.
+
+        Raises:
+            ValueError: If a priority order is missing subtasks or schedules a
+                successor before its predecessor.
+        """
+        for device_id, task_dag in task_dags.items():
+            priority_order = priorities.get(device_id, [])
+            expected_subtasks = set(task_dag.subtasks.keys())
+            ordered_subtasks = set(priority_order)
+            if ordered_subtasks != expected_subtasks:
+                raise ValueError(
+                    f"Priority order for device {device_id} must contain every subtask exactly once."
+                )
+
+            priority_index = {
+                subtask_id: order_index for order_index, subtask_id in enumerate(priority_order)
+            }
+            for predecessor_id, successor_id in task_dag.edges:
+                if priority_index[predecessor_id] > priority_index[successor_id]:
+                    raise ValueError(
+                        f"Priority order schedules predecessor {predecessor_id} after successor "
+                        f"{successor_id} for device {device_id}."
+                    )
 
     def reset(self, task_dags: Dict[int, TaskDAG], priorities: Dict[int, List[int]]) -> np.ndarray:
         """Reset the episode and start the first time slot.
@@ -191,11 +242,13 @@ class DITENEnv:
 
         subtask_count = len(self.task_dags[self.devices[0].id].subtasks)
         slot_done = all(self.current_step[d.id] >= subtask_count for d in self.devices)
-        self._advance_mobility_within_slot(subtask_count)
+        # self._advance_mobility_within_slot(subtask_count)
 
         if slot_done:
             self.current_slot_index += 1
             self.current_slot = self.current_slot_index * self.slot_duration
+            for device in self.devices:
+                self._move_device_on_path(device, self.slot_duration)
             self._update_connection_windows()
 
         episode_done = self.current_slot_index >= self.time_slots
@@ -233,7 +286,7 @@ class DITENEnv:
             current_subtask_id = priority_list[step_idx]
             subtask = task_dag.subtasks[current_subtask_id]
 
-            predecessor_ready_time, tx_energy = self._resolve_predecessor_ready_time(
+            predecessor_ready_time, tx_energy, transfer_time = self._resolve_predecessor_ready_time(
                 device=device, task_dag=task_dag, current_subtask_id=current_subtask_id, action=requested_action
             )
 
@@ -246,6 +299,7 @@ class DITENEnv:
                 "requested_action": requested_action,
                 "predecessor_ready_time": predecessor_ready_time,
                 "tx_energy": tx_energy,
+                "transfer_time": transfer_time,
                 "p_out": 0.0,
                 "rejected": False,
             }
@@ -282,6 +336,11 @@ class DITENEnv:
                     "resolved_action": 0,
                     "start_time": start_time,
                     "finish_time": finish_time,
+                    "local_time": comp_time,
+                    "server_time": 0.0,
+                    "attempted_server_time": 0.0,
+                    "queue_or_wait_time": max(0.0, start_time - self.current_slot),
+                    "penalty_time": 0.0,
                     "f_est": est_power,
                     "f_actual": actual_power,
                     "e_comp": comp_energy,
@@ -348,11 +407,21 @@ class DITENEnv:
                     local_finish_snapshot[device.id] = local_finish
                     item["rejected"] = True
                     item["p_out"] = self.p_out_value
+                    item["attempted_start_time"] = start_time
+                    item["attempted_finish_time"] = finish_time
+                    item["penalty_time"] = (
+                        max(0.0, item["l_start"] - start_time)
+                        + max(0.0, finish_time - item["l_end"])
+                    )
                     item.update(
                         {
                             "resolved_action": 0,
                             "start_time": local_start,
                             "finish_time": local_finish,
+                            "local_time": local_time,
+                            "server_time": 0.0,
+                            "attempted_server_time": comp_time,
+                            "queue_or_wait_time": max(0.0, local_start - self.current_slot),
                             "f_est": local_est_power,
                             "f_actual": local_actual_power,
                             "e_comp": local_energy,
@@ -375,6 +444,11 @@ class DITENEnv:
                             "resolved_action": action,
                             "start_time": start_time,
                             "finish_time": finish_time,
+                            "local_time": 0.0,
+                            "server_time": comp_time,
+                            "attempted_server_time": comp_time,
+                            "queue_or_wait_time": max(0.0, start_time - self.current_slot),
+                            "penalty_time": 0.0,
                             "f_est": est_power,
                             "f_actual": actual_power,
                             "e_comp": comp_energy,
@@ -404,21 +478,37 @@ class DITENEnv:
                         "device_id": float(device.id),
                         "subtask_id": -1.0,
                         "action": -1.0,
+                        "requested_action": -1.0,
                         "f_est": 0.0,
                         "f_actual": 0.0,
+                        "current_slot": float(self.current_slot),
+                        "start_time": 0.0,
+                        "finish_time": 0.0,
+                        "execution_time": 0.0,
+                        "local_time": 0.0,
+                        "server_time": 0.0,
+                        "attempted_server_time": 0.0,
+                        "queue_or_wait_time": 0.0,
+                        "transfer_time": 0.0,
                         "delay": 0.0,
                         "energy": 0.0,
                         "tx_energy": 0.0,
                         "comp_energy": 0.0,
                         "reward": 0.0,
                         "p_out": 0.0,
+                        "penalty_applied": 0.0,
+                        "penalty_time": 0.0,
+                        "fallback_local": 0.0,
                     }
                 )
                 continue
             task_dag = item["task_dag"]
             current_subtask_id = item["subtask_id"]
 
-            instant_delay = max(0.0, item["finish_time"] - self.current_slot)
+            # instant_delay = max(0.0, item["finish_time"] - self.current_slot)
+            instant_delay = item["transfer_time"] + item["queue_or_wait_time"] + (
+                item["finish_time"] - item["start_time"]
+            )
             instant_energy = item["tx_energy"] + item["e_comp"]
 
             self.subtask_finish_times[device.id][current_subtask_id] = item["finish_time"]
@@ -440,14 +530,26 @@ class DITENEnv:
                     "device_id": float(device.id),
                     "subtask_id": float(current_subtask_id),
                     "action": float(item["resolved_action"]),
+                    "requested_action": float(item["requested_action"]),
                     "f_est": float(item["f_est"]),
                     "f_actual": float(item["f_actual"]),
+                    "current_slot": float(self.current_slot),
+                    "start_time": float(item["start_time"]),
+                    "finish_time": float(item["finish_time"]),
+                    "execution_time": float(item["finish_time"] - item["start_time"]),
+                    "local_time": float(item["local_time"]),
+                    "server_time": float(item["server_time"]),
+                    "attempted_server_time": float(item["attempted_server_time"]),
+                    "queue_or_wait_time": float(item["queue_or_wait_time"]),
+                    "transfer_time": float(item["transfer_time"]),
                     "delay": float(instant_delay),
                     "energy": float(instant_energy),
                     "tx_energy": float(item["tx_energy"]),
                     "comp_energy": float(item["e_comp"]),
                     "reward": float(reward),
                     "p_out": float(item["p_out"]),
+                    "penalty_applied": float(1.0 if item["p_out"] != 0.0 else 0.0),
+                    "penalty_time": float(item["penalty_time"]),
                     "fallback_local": float(1.0 if item.get("rejected", False) else 0.0),
                 }
             )
@@ -474,7 +576,7 @@ class DITENEnv:
 
     def _resolve_predecessor_ready_time(
         self, device: IndustrialDevice, task_dag: TaskDAG, current_subtask_id: int, action: int
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, float, float]:
         """Compute earliest start time and transfer energy from predecessors.
 
         Args:
@@ -484,11 +586,14 @@ class DITENEnv:
             action: Requested execution location (0 local, >0 edge).
 
         Returns:
-            Tuple of (predecessor_ready_time, transfer_energy).
+            Tuple of (predecessor_ready_time, transfer_energy, transfer_time).
         """
         predecessors = [pred for pred, succ in task_dag.edges if succ == current_subtask_id]
-        predecessor_ready_time = 0.0
+        # predecessor_ready_time = 0.0
+        slot_start = self.current_slot_index * self.slot_duration
+        predecessor_ready_time = slot_start
         tx_energy = 0.0
+        transfer_time = 0.0
         for pred_id in predecessors:
             pred_finish = self.subtask_finish_times[device.id].get(pred_id, 0.0)
             pred_location = self.subtask_locations[device.id].get(pred_id, 0)
@@ -498,6 +603,7 @@ class DITENEnv:
                 )
                 pred_finish += trans_delay
                 tx_energy += trans_energy
+                transfer_time += trans_delay
             predecessor_ready_time = max(predecessor_ready_time, pred_finish)
 
         # Eq. (15)-(17) term for first offloaded subtask: upload raw subtask input to edge server.
@@ -505,10 +611,12 @@ class DITENEnv:
             input_delay, input_energy = self._calculate_input_upload(
                 device, action, task_dag.subtasks[current_subtask_id].data_size
             )
-            predecessor_ready_time += input_delay
+            # predecessor_ready_time += input_delay
+            predecessor_ready_time = slot_start + input_delay
             tx_energy += input_energy
+            transfer_time += input_delay
 
-        return predecessor_ready_time, tx_energy
+        return predecessor_ready_time, tx_energy, transfer_time
 
     def _calculate_result_transfer(
         self, device: IndustrialDevice, task_dag: TaskDAG, pred_id: int, pred_location: int, action: int
@@ -592,6 +700,8 @@ class DITENEnv:
         t_comp, e_comp = self.network_env.calculate_edge_computation(
             subtask.cpu_cycles, server.energy_coeff, f_est, f_actual
         )
+        #
+        # e_comp = 0
         server_wait = self._compute_waiting_delay_server(server)
         l_start, l_end = self.connection_windows[(device.id, server.id)]
         start_time = max(self.current_slot + server_wait, predecessor_ready_time, l_start + 1e-9)
