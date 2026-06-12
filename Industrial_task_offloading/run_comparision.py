@@ -14,7 +14,7 @@ import json
 import os
 from tqdm import trange
 from baselines.maac import MAACAgent
-from baselines.mappo import MAPPOAgent
+from baselines.mappo import MAPPOAgent, MultiAgentRolloutBuffer
 from baselines.offloading_baselines import (
     EdgeOnlyAgent,
     FeatureExtractionEdgeAgent,
@@ -37,6 +37,16 @@ from ultils.paper_config import PAPER_PARAMS
 import time
 
 
+FIXED_BASELINE_ALGORITHMS = frozenset(
+    {
+        "Local Only",
+        "Edge Only",
+        "Feature Extraction Edge",
+        "Random Offloading",
+    }
+)
+
+
 def set_seed(seed: int = 42) -> None:
     """Set random seeds for reproducible runs.
 
@@ -57,9 +67,9 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
     confirmed = PAPER_PARAMS["confirmed"]
     provisional = PAPER_PARAMS["provisional_table2_needed"]
     return {
-        "Local Only": {"class": LocalOnlyAgent, "kwargs": {}},
-        "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
-        "Feature Extraction Edge": {"class": FeatureExtractionEdgeAgent, "kwargs": {}},
+        # "Local Only": {"class": LocalOnlyAgent, "kwargs": {}},
+        # "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
+        # "Feature Extraction Edge": {"class": FeatureExtractionEdgeAgent, "kwargs": {}},
         # "Random Offloading": {"class": RandomOffloadingAgent, "kwargs": {}},
         "e-ATN-MADDPG": {
             "class": EpsilonATNMADDPGAgent,
@@ -72,10 +82,85 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "decay": provisional["epsilon_decay"],
             },
         },
-        # "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
         "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
 
     }
+
+
+def _episodes_for_algorithm(algo_name: str, full_episodes: int, baseline_episodes: int) -> int:
+    """Return the episode budget for a learning algorithm or fixed baseline."""
+    if algo_name in FIXED_BASELINE_ALGORITHMS:
+        return min(full_episodes, baseline_episodes)
+    return full_episodes
+
+
+def _mean_flat_history(history: Sequence[float], target_episodes: int) -> List[float]:
+    """Convert a short fixed-baseline history into a mean-flat plot line."""
+    if not history or target_episodes <= 0:
+        return []
+    mean_value = float(np.mean(history))
+    return [mean_value for _ in range(target_episodes)]
+
+
+def _build_plot_results(
+    raw_results: Dict[str, Dict[str, List[float]]], target_episodes: int
+) -> Dict[str, Dict[str, List[float]]]:
+    """Build plot histories, extending fixed baselines as mean-flat lines."""
+    plot_results: Dict[str, Dict[str, List[float]]] = {}
+    for metric_name, algorithm_histories in raw_results.items():
+        plot_results[metric_name] = {}
+        for algo_name, history in algorithm_histories.items():
+            if algo_name in FIXED_BASELINE_ALGORITHMS:
+                plot_results[metric_name][algo_name] = _mean_flat_history(history, target_episodes)
+            else:
+                plot_results[metric_name][algo_name] = list(history)
+    return plot_results
+
+
+def _last_training_state_line(
+    algo_name: str, history: Dict[str, List[float]], episode_count: int
+) -> Dict[str, object]:
+    """Build one flat JSONL row for the final training state of one model."""
+    def last_value(metric_name: str) -> float:
+        values = history.get(metric_name, [])
+        return float(values[-1]) if values else 0.0
+
+    requested_local = int(round(last_value("requested_local_count")))
+    requested_edge = int(round(last_value("requested_edge_count")))
+    resolved_local = int(round(last_value("resolved_local_count")))
+    resolved_edge = int(round(last_value("resolved_edge_count")))
+
+    return {
+        "model": algo_name,
+        "episode": int(episode_count),
+        "reward": last_value("reward"),
+        "delay_s": last_value("delay"),
+        "energy_j": last_value("energy"),
+        "local_count": requested_local,
+        "edge_count": requested_edge,
+        "local_ratio_percent": last_value("local_ratio"),
+        "edge_ratio_percent": last_value("edge_ratio"),
+        "requested_local_count": requested_local,
+        "requested_edge_count": requested_edge,
+        "resolved_local_count": resolved_local,
+        "resolved_edge_count": resolved_edge,
+        "local_time_s": last_value("local_time"),
+        "server_time_s": last_value("server_time"),
+        "transfer_time_s": last_value("transfer_time"),
+        "wait_time_s": last_value("queue_or_wait_time"),
+        "penalty_count": int(round(last_value("penalty_count"))),
+        "penalty_time_s": last_value("penalty_time"),
+    }
+
+
+def _write_last_training_state_jsonl(
+    output_path: str, rows: Sequence[Dict[str, object]]
+) -> None:
+    """Write one final-state JSON object per model line."""
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        for row in rows:
+            output_file.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
 def build_priorities_by_mode(
@@ -128,6 +213,9 @@ def _collect_joint_actions(
             priority_order = env.priorities.get(device.id, [])
             subtask_id = priority_order[step_index] if step_index < len(priority_order) else -1
             action = agent.select_action_for_subtask(agent_state, subtask_id)
+        elif hasattr(agent, "select_action_with_log_prob"):
+            action, log_prob = agent.select_action_with_log_prob(agent_state)
+            agent.last_action_log_prob = log_prob
         else:
             action = agent.select_action(agent_state)
         joint_actions.append(action)
@@ -215,7 +303,7 @@ def _format_diagnostic_summary(algo_name: str, episode_number: int, history: Dic
 
 def _should_print_diagnostics(episode_number: int, num_episodes: int) -> bool:
     """Return whether to print readable diagnostics for this episode."""
-    return episode_number == num_episodes or episode_number % 50 == 0
+    return episode_number == num_episodes or episode_number % 500 == 0 or episode_number == 1
 
 
 def _update_agents_from_buffer(
@@ -283,6 +371,31 @@ def _update_agents_from_buffer(
             agent.update_epsilon()
 
 
+def _update_agents_from_rollout(
+    agents: Sequence[object],
+    rollout_buffer: MultiAgentRolloutBuffer,
+    gamma: float,
+) -> None:
+    """Update on-policy MAPPO agents from a collected rollout and clear it."""
+    if len(rollout_buffer) == 0:
+        return
+
+    state_b, action_b, reward_b, next_state_b, old_log_prob_b, done_b = (
+        rollout_buffer.as_tensors()
+    )
+    for agent_index, agent in enumerate(agents):
+        agent.update_agent(
+            state_b,
+            action_b,
+            reward_b,
+            next_state_b,
+            agent_index=agent_index,
+            old_log_prob_b=old_log_prob_b,
+            done_b=done_b,
+        )
+    rollout_buffer.clear()
+
+
 def train_algorithm(
     algo_name: str,
     agent_config: Dict[str, object],
@@ -323,16 +436,15 @@ def train_algorithm(
         slot_duration=confirmed["slot_duration_s"],
         subslot_count=200,
         time_slots=time_slots,
-        lambda1=1,
-        lambda2=2,
-        lambda3=1,
-        lambda4=2,
+        lambda1=2,
+        lambda2=3,
+        lambda3=0.8,
+        lambda4=1.2,
         lambda5=1,
-        p_out_value=-0.5,
+        p_out_value=-0.7,
         local_estimation_error=0.2,
         edge_estimation_error=0.1,
     )
-    
     # State/Action dimensions
     STATE_DIM = env.get_state_dim()
     ACTION_DIM = 1 + len(servers)
@@ -350,6 +462,8 @@ def train_algorithm(
         agents.append(agent)
 
     replay_buffer = MultiAgentReplayBuffer(capacity=int(provisional["replay_buffer_capacity"]))
+    rollout_buffer = MultiAgentRolloutBuffer()
+    uses_rollout_buffer = all(hasattr(agent, "select_action_with_log_prob") for agent in agents)
     batch_size = int(provisional["batch_size"])
     gamma = provisional["gamma"]
     
@@ -436,7 +550,23 @@ def train_algorithm(
                 slot_requested_edge_counts.append(metric_summary["requested_edge_count"])
                 slot_resolved_local_counts.append(metric_summary["resolved_local_count"])
                 slot_resolved_edge_counts.append(metric_summary["resolved_edge_count"])
-                replay_buffer.push(current_joint_state, joint_actions, joint_rewards, next_joint_state)
+                if uses_rollout_buffer:
+                    old_log_probs = [
+                        float(getattr(agent, "last_action_log_prob", 0.0))
+                        for agent in agents
+                    ]
+                    rollout_buffer.push(
+                        current_joint_state,
+                        joint_actions,
+                        joint_rewards,
+                        next_joint_state,
+                        old_log_probs,
+                        done=step_episode_done,
+                    )
+                else:
+                    replay_buffer.push(
+                        current_joint_state, joint_actions, joint_rewards, next_joint_state
+                    )
                 current_joint_state = next_joint_state
         
             total_slot_actions = slot_local + slot_edge
@@ -512,10 +642,13 @@ def train_algorithm(
         if _should_print_diagnostics(episode_number, num_episodes):
             episode_iterator.write(_format_diagnostic_summary(algo_name, episode_number, history))
          
-        # 4. Network Updates (Standard MADDPG logic)
-        _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
+        # 4. Network Updates
+        if uses_rollout_buffer:
+            _update_agents_from_rollout(agents, rollout_buffer, gamma)
+        else:
+            _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
     
-        if episode_number % 50 == 0:
+        if episode_number % 500 == 0 or episode_number == 1:
             print(
                 f"[{algo_name}] Ep {episode_number}/{num_episodes} ----|--- Avg R/Slot: {history['reward'][-1]:.3f} "
                 f"---|--- D: {history['delay'][-1]:.3f}s ---|--- E: {history['energy'][-1]:.3f}J"
@@ -573,7 +706,7 @@ if __name__ == "__main__":
         EdgeServer(
             j + 1,
             loc,
-            np.random.uniform(3.3, 3.5) * 1e9,
+            np.random.uniform(5.3, 5.5) * 1e9,
             confirmed["server_tx_power_w"],
             confirmed["server_energy_coeff"],
             coverage_radius=confirmed["coverage_radius_m"],
@@ -607,7 +740,10 @@ if __name__ == "__main__":
     # 3. Run Comparisons
     results = {"reward": {}, "delay": {}, "energy": {}}
     priority_results = {"reward": {}, "delay": {}, "energy": {}}
-    EPISODES = 10 # Use a smaller number (e.g., 100) for testing
+    FULL_EPISODES = 300
+    BASELINE_EVALUATION_EPISODES = 5
+    algorithm_episode_counts = {}
+    last_training_state_rows = []
 
     # Fig.6-style priority extraction comparison under fixed e-ATN-MADDPG.
     priority_modes = {"Random Scheduling": "random", "Greedy Scheduling": "greedy", "GCN Scheduling": "gcn"}
@@ -632,7 +768,7 @@ if __name__ == "__main__":
     #         network_env,
     #         data_loader,
     #         gcn_model=gcn_model,
-    #         num_episodes=EPISODES,
+    #         num_episodes=FULL_EPISODES,
     #         priority_mode=mode,
     #     )
     #     priority_results["reward"][label] = history["reward"]
@@ -640,6 +776,12 @@ if __name__ == "__main__":
     #     priority_results["energy"][label] = history["energy"]
 
     for algo_name, config in algorithms.items():
+        run_episodes = _episodes_for_algorithm(
+            algo_name,
+            full_episodes=FULL_EPISODES,
+            baseline_episodes=BASELINE_EVALUATION_EPISODES,
+        )
+        algorithm_episode_counts[algo_name] = run_episodes
         history = train_algorithm(
             algo_name,
             config,
@@ -647,22 +789,26 @@ if __name__ == "__main__":
             servers,
             network_env,
             data_loader,
-            num_episodes=EPISODES,
+            num_episodes=run_episodes,
             gcn_model=gcn_model,
             priority_mode="gcn",
         )
         results["reward"][algo_name] = history["reward"]
         results["delay"][algo_name] = history["delay"]
         results["energy"][algo_name] = history["energy"]
+        last_training_state_rows.append(
+            _last_training_state_line(algo_name, history, episode_count=run_episodes)
+        )
 
     # 4. Plotting Results
     print("\nAll training complete! Generating comparison plots...")
     plotter = DITENPlotter2()
+    plot_results = _build_plot_results(results, target_episodes=FULL_EPISODES)
     
     # Plot Reward (Like Fig. 8)
     date_string = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     plotter.plot_training_curve(
-        data_dict=results["reward"], 
+        data_dict=plot_results["reward"], 
         title="Performance Comparison in Reward", 
         ylabel="Reward", 
         filename=f"{date_string}_comparison_reward.png"
@@ -670,7 +816,7 @@ if __name__ == "__main__":
     
     # Plot Delay (Like Fig. 9)
     plotter.plot_training_curve(
-        data_dict=results["delay"], 
+        data_dict=plot_results["delay"], 
         title="Performance Comparison in Task Processing Delay", 
         ylabel="Task Processing Delay (s)", 
         filename=f"{date_string}_comparison_delay.png"
@@ -678,7 +824,7 @@ if __name__ == "__main__":
     
     # Plot Energy (Like Fig. 10)
     plotter.plot_training_curve(
-        data_dict=results["energy"], 
+        data_dict=plot_results["energy"], 
         title="Performance Comparison in Energy Consumption", 
         ylabel="Energy Consumption (J)", 
         filename=f"{date_string}_comparison_energy.png"
@@ -691,22 +837,9 @@ if __name__ == "__main__":
     #     filename=f"{date_string}_priority_comparison_reward.png",
     # )
 
-    os.makedirs("plots", exist_ok=True)
-    results_path = os.path.join("plots", f"{date_string}_comparison_results.json")
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "metadata": {
-                    "episodes": EPISODES,
-                    "dataset_total_images": dataset_stats["total_images"],
-                    "dataset_paper_expected_images": 399,
-                    "dataset_paper_count_aligned": dataset_stats["is_paper_count_aligned"],
-                },
-                "algorithm_results": results,
-                "priority_results": priority_results,
-            },
-            f,
-            indent=2,
-        )
+    last_state_path = os.path.join(
+        plotter.save_dir, f"{date_string}_last_training_state.jsonl"
+    )
+    _write_last_training_state_jsonl(last_state_path, last_training_state_rows)
     
-    print(f"Plots and results saved successfully! JSON: {results_path}")
+    print(f"Plots and last training states saved successfully! JSONL: {last_state_path}")

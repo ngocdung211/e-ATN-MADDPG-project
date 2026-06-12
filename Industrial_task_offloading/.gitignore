@@ -17,3 +17,5 @@ dataset/KolektorSDD/
 plots/
 .agents/
 AGENTS.md
+.tmp*/
+.tmp.driveupload/

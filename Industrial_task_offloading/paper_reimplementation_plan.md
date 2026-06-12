@@ -14,7 +14,7 @@
 
 ## Current Checkpoint - 2026-06-11
 
-**Status:** User manually fixed the environment, and the baseline instrumentation is ready to verify whether the environment is now good enough for model training.
+**Status:** Environment is frozen for the first e-ATN-MADDPG sanity phase. The user manually fixed the environment and reported it is good enough for the model to run.
 
 What is now implemented:
 - [x] Local-only baseline.
@@ -25,6 +25,9 @@ What is now implemented:
 - [x] Action diagnostics for requested local/edge counts and actual resolved local/edge counts.
 - [x] Readable comparison output for short runs, printed only on the final episode.
 - [x] Environment logic was manually adjusted by the user and is reported as good enough for the model to run.
+- [x] Environment freeze decision: do not change `environment/diten_env.py`, `environment/network_env.py`, or `dataset/data_loader.py` during the first model sanity phase.
+- [x] Efficient 100-episode comparison plotting: train learning models for 100 episodes, run fixed baselines for a short evaluation, and plot fixed baselines as mean-flat reference lines.
+- [x] Last training state JSONL: save one flat line per model beside the generated plot images for easy comparison.
 
 Current output should now look like:
 
@@ -48,32 +51,82 @@ Interpretation:
 
 Stop after each task and wait for user verification.
 
-1. [ ] **Verify the user-fixed environment with a short baseline run**
-   - Goal: Confirm the updated environment behaves plausibly before touching DRL again.
-   - Run: 10 episodes for Local Only, Edge Only, Feature Extraction Edge, and Random Offloading.
+1. [x] **Verify e-ATN-MADDPG agent mechanics**
+   - Goal: Confirm current `EpsilonATNMADDPGAgent` can act and update before running longer training.
+   - Files to inspect/test only:
+     - `models/maddpg.py`
+     - `models/replay_buffer.py`
+     - `run_comparision.py::_update_agents_from_buffer`
    - Verify:
-     - All methods produce finite reward, delay, and energy.
-     - Local Only has `Requested actions: edge=0`.
-     - Feature Extraction Edge should not be worse than Local Only if offloading feature extraction is physically beneficial under the fixed env.
-     - If Feature Extraction Edge still loses to Local Only, inspect the final diagnostics before changing reward weights: penalty count/time, transfer time, server time, and wait time.
+     - `select_action` with epsilon `1.0` samples valid random actions. `DONE`
+     - `select_action` with epsilon disabled uses actor argmax. `DONE`
+     - replay buffer samples shape correctly for multi-agent training. `DONE`
+     - actor parameters change after one update. `DONE`
+     - critic parameters change after one update. `DONE`
+     - target networks move after soft update. `DONE`
+   - Result: mechanics tests pass without production model changes.
+   - Verification: `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_maddpg_update.py -q -p no:cacheprovider`
 
-2. [ ] **Freeze the environment for the first model sanity run**
-   - Goal: Stop changing environment physics while checking whether MADDPG can learn.
-   - Verify:
-     - No more env changes unless the baseline diagnostics show a concrete environment bug.
-     - Keep reward weights and communication model unchanged for the first sanity run.
-
-3. [ ] **Run MADDPG/e-ATN-MADDPG smoke training**
+2. [x] **Run e-ATN-MADDPG smoke training on frozen env**
    - Goal: Verify model execution path runs on the fixed environment.
-   - Run: very small episode count first, then stop.
+   - Run: very small episode count first, for example 1-3 episodes.
    - Verify:
-     - No crash.
-     - Replay buffer receives samples.
-     - Actor update path is active.
-     - Reward, delay, energy are finite.
-     - Final diagnostics show meaningful requested/actual local-edge counts.
+     - no crash. `DONE by user`
+     - replay buffer receives samples. `DONE by user`
+     - actor/critic update path runs. `DONE by user`
+     - reward, delay, and energy are finite. `DONE by user`
+     - epsilon decays. `DONE by user`
+     - final diagnostics show meaningful requested/actual local-edge counts. `DONE by user`
 
-4. [ ] **Compare MADDPG against simple baselines only after smoke passes**
+3. [x] **Verify MAPPO baseline mechanics**
+   - Goal: Confirm current `MAPPOAgent` can act and update before trusting it as a comparison baseline.
+   - Files to inspect/test only:
+     - `baselines/mappo.py`
+     - `run_comparision.py::_update_agents_from_buffer`
+   - Verify:
+     - stochastic actor outputs a valid probability distribution. `DONE`
+     - `select_action` samples valid discrete actions. `DONE`
+     - centralized value critic accepts flattened joint state and returns one value per sample. `DONE`
+     - actor parameters change after one MAPPO update. `DONE`
+     - critic parameters change after one MAPPO update. `DONE`
+     - comparison update loop routes MAPPO agents through `update_agent`. `DONE`
+   - Result: MAPPO mechanics tests pass without production code changes.
+   - Verification: `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_mappo_update.py -q -p no:cacheprovider`
+
+4. [x] **Fix MAPPO rollout buffer correctness**
+   - Goal: Make MAPPO use on-policy rollout data instead of replay memory samples.
+   - Files touched:
+     - `baselines/mappo.py`
+     - `run_comparision.py`
+     - `tests/test_mappo_update.py`
+   - Verify:
+     - MAPPO stores action log-probability when sampling action. `DONE`
+     - MAPPO rollout buffer stores state, action, reward, next state, old log-probability, and done. `DONE`
+     - PPO update uses rollout old log-probabilities instead of recomputing them after collection. `DONE`
+     - PPO target value masks terminal transitions with `done`. `DONE`
+     - comparison loop routes MAPPO through rollout update and clears the rollout after update. `DONE`
+   - Verification: `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_mappo_update.py -q -p no:cacheprovider`
+
+5. [ ] **Add e-ATN-MADDPG training diagnostics if smoke output is insufficient** `CURRENT`
+   - Goal: Make model learning observable without changing env.
+   - Candidate diagnostics:
+     - actor loss.
+     - critic loss.
+     - epsilon.
+     - replay buffer size.
+     - action distribution.
+   - Rule: add diagnostics only if the smoke run does not already show enough information to judge model health.
+
+6. [ ] **Run short e-ATN-MADDPG learning check**
+   - Goal: Check whether reward trend and action behavior move in a plausible direction.
+   - Run: 10-30 episodes.
+   - Verify:
+     - reward does not become NaN or explode.
+     - delay/energy are finite.
+     - action distribution does not collapse immediately without explanation.
+     - if reward is flat, inspect actor/critic losses before changing reward/env.
+
+7. [ ] **Compare e-ATN-MADDPG against simple baselines only after smoke passes**
    - Goal: Check trend direction, not exact paper numbers.
    - Compare against:
      - Local Only
@@ -81,10 +134,12 @@ Stop after each task and wait for user verification.
      - Feature Extraction Edge
      - Random Offloading
    - Verify:
-     - MADDPG should improve over episodes.
-     - If MADDPG cannot beat simple baselines, first inspect model training/update path before changing the environment again.
+     - Learning algorithms run for the requested full episode count. `DONE`
+     - Fixed baselines run for a shorter episode count and are extended only for plotting. `DONE`
+     - e-ATN-MADDPG should improve over episodes.
+     - If e-ATN-MADDPG cannot beat simple baselines, first inspect model training/update path before changing the frozen environment.
 
-5. [ ] **Only then move toward paper-style long training**
+8. [ ] **Only then move toward paper-style long training**
    - Goal: Produce a training trend similar to the paper where the MADDPG-based method is best.
    - Verify:
      - Do not tune reward weights until baseline and smoke model runs are understood.
@@ -92,9 +147,160 @@ Stop after each task and wait for user verification.
 
 ---
 
+## Ablation Study Queue - Graph-GAT State Encoder
+
+Purpose: test whether converting the flat environment state into a topology graph and encoding it with GAT gives DRL models a better state representation for task offloading.
+
+Working assumption:
+- "Typology" means topology: device nodes, edge-server nodes, task/subtask features, connection-window features, queue/wait features, and feasible device-server links.
+- This is a new ablation/proposal path, not a paper-faithful baseline.
+- GAT is a reusable state encoder idea, not tied to only one DRL algorithm.
+- First integration target is MAPPO because its rollout/PPO update path is now corrected and easier to extend with graph-state rollouts.
+- Later integration targets can include e-ATN-MADDPG and MAAC after the MAPPO ablation is verified.
+- Implementation choice: use Option A first, a separate `GraphGATMAPPOAgent`, while keeping reusable graph/GAT utilities. Do not refactor all DRL models or put trainable GAT only in the training loop yet.
+- Rationale: a separate agent is safer for the first ablation because it does not risk breaking flat-state MAPPO, and it keeps GAT inside the model/update path so gradients can update GAT correctly.
+- The first ablation comparison is:
+  - flat-state MAPPO.
+  - Graph-GAT MAPPO.
+
+Stop after each small task and wait for user verification.
+
+1. [x] **Define graph-state representation**
+   - Goal: Decide exactly how to convert current flat state into graph data.
+   - Candidate node types:
+     - device node: local compute power, local wait, current subtask CPU/data/result, accumulated local context.
+     - server node: edge compute power, edge wait.
+   - Candidate edge types:
+     - device-to-server edge when the connection window is valid.
+     - edge features: normalized `l_start`, `l_end`, window length, optional transfer-rate estimate.
+   - Verify:
+     - [x] graph can be built from information already available in `DITENEnv._get_joint_state`.
+     - [x] no environment physics changes.
+     - [x] graph shape is stable from `joint_state`, `num_devices`, and `num_servers`.
+
+2. [x] **Add graph builder tests before implementation**
+   - Goal: Lock the graph API before adding model code.
+   - Candidate file:
+     - `tests/test_topology_graph_state.py`
+   - Verify:
+     - [x] node feature tensor shape is `(num_devices + num_servers, node_feature_dim)`.
+     - [x] edge index shape is `(2, num_edges)`.
+     - [x] edge feature tensor length matches `num_edges`.
+     - [x] disconnected server windows do not create valid offload edges.
+
+3. [x] **Implement minimal topology graph builder**
+   - Goal: Convert existing flat joint state into graph tensors without touching env internals.
+   - Candidate file:
+     - `ultils/topology_graph_state.py`
+   - Rule:
+     - read only the current `joint_state`, `num_devices`, and `num_servers`.
+     - do not change `DITENEnv._get_joint_state`.
+   - Verify:
+     - [x] graph builder tests pass with `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_topology_graph_state.py -q -p no:cacheprovider`.
+
+4. [x] **Add a small GAT encoder unit test**
+   - Goal: Verify the encoder can consume graph tensors and produce one embedding per device.
+   - Candidate files:
+     - `models/topology_gat.py`
+     - `tests/test_topology_gat.py`
+   - Verify:
+     - [x] output shape is `(num_devices, embedding_dim)`.
+     - [x] gradients flow through the encoder.
+     - [x] encoder works without `torch_geometric` unless the repo already depends on it.
+
+5. [x] **Implement minimal GAT state encoder**
+   - Goal: Create a small PyTorch-only GAT encoder to avoid new dependencies.
+   - Candidate architecture:
+     - one or two graph-attention layers.
+     - masked attention over graph edges.
+     - output only device-node embeddings for actor input.
+   - Verify:
+     - [x] unit tests pass with `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_topology_gat.py -q -p no:cacheprovider`.
+     - [x] no training script changes yet.
+
+6. [ ] **Create Graph-GAT MAPPO ablation agent tests** (next)
+   - Goal: Define the first graph-state DRL integration around MAPPO before implementation.
+   - Candidate files:
+     - `tests/test_graph_gat_mappo.py`
+     - `baselines/graph_gat_mappo.py`
+   - Verify:
+     - action dimension remains `0=local, 1..S=edge server`.
+     - actor samples valid actions from graph-derived device embeddings.
+     - rollout buffer can store graph states, next graph states, actions, rewards, old log-probs, and done flags.
+     - GAT parameters change after one PPO rollout update.
+     - flat-state `MAPPOAgent` tests still pass unchanged.
+
+7. [ ] **Implement Graph-GAT MAPPO agent**
+   - Goal: Add a separate MAPPO variant that consumes graph states through a GAT encoder.
+   - Candidate name:
+     - `GraphGATMAPPOAgent`
+   - Candidate file:
+     - `baselines/graph_gat_mappo.py`
+   - Verify:
+     - uses `TopologyGATEncoder` to create one embedding per device.
+     - MAPPO actor uses each device embedding to sample an action.
+     - centralized critic uses graph/device embeddings or a graph-level pooled representation.
+     - PPO update backpropagates through MAPPO and GAT.
+     - no changes are required in `baselines/mappo.py` for flat MAPPO behavior.
+
+8. [ ] **Wire Graph-GAT MAPPO into comparison config behind a separate name**
+   - Goal: Add the model as an optional comparison line, not as a replacement for flat MAPPO.
+   - Candidate display name:
+     - `Graph-GAT MAPPO`
+   - Candidate file:
+     - `run_comparision.py`
+   - Verify:
+     - original flat-state `MAPPO` still runs.
+     - `Graph-GAT MAPPO` can run 1-3 smoke episodes.
+     - JSONL saves a separate one-line final state for the ablation model.
+
+9. [ ] **Run Graph-GAT MAPPO smoke test**
+   - Goal: Check integration before long training.
+   - Run:
+     - 1-3 episodes for `Graph-GAT MAPPO`.
+   - Verify:
+     - no crash.
+     - reward/delay/energy finite.
+     - graph rollout buffer fills.
+     - PPO actor/critic/GAT update path runs.
+
+10. [ ] **Run short MAPPO ablation comparison**
+   - Goal: Compare trend, not final paper-quality numbers.
+   - Compare:
+     - flat-state MAPPO.
+     - Graph-GAT MAPPO.
+   - Run:
+     - 10-30 episodes first.
+   - Verify:
+     - Graph-GAT MAPPO does not collapse to all-local/all-edge immediately.
+     - Graph-GAT MAPPO has plausible action distribution.
+     - if Graph-GAT MAPPO is worse, inspect graph features and attention before tuning reward.
+
+11. [ ] **Attach reusable GAT encoder to other models only after MAPPO ablation works**
+   - Goal: Extend the same graph-state encoder idea after the MAPPO path is stable.
+    - Candidate next targets:
+      - Graph-GAT e-ATN-MADDPG.
+      - Graph-GAT MAAC.
+    - Verify:
+      - each new model is added as a separate comparison line.
+      - the flat-state version remains as the control.
+      - only consider a shared encoder abstraction after at least one graph model shows useful behavior.
+
+12. [ ] **Run final ablation only after short comparison is stable**
+    - Goal: Produce a clean ablation result.
+    - Compare:
+      - flat-state MAPPO control.
+      - Graph-GAT MAPPO proposal.
+      - optional Graph-GAT e-ATN-MADDPG only after separate smoke tests.
+    - Verify:
+      - plots and JSONL include each model as separate lines.
+      - result summary clearly states this is a proposed graph-state encoder ablation, not the original paper model.
+
+---
+
 ## Current Status
 
-- [x] Read `AGENTS.md` and `CLAUDE.md`.
+- [x] Read the `AGENTS.md` rules supplied by the user; skip `CLAUDE.md` per user request.
 - [x] Inspect repo structure and identify main code paths.
 - [x] Read current environment code in `environment/diten_env.py`.
 - [x] Read system model code in `environment/system_model.py`.
@@ -320,12 +526,11 @@ Stop after each task and wait for user verification.
 
 ---
 
-## Immediate Next Question
+## Immediate Next Step
 
-Before writing baseline code, confirm what "random" means:
+Run the first frozen-env DRL task: verify the current `EpsilonATNMADDPGAgent` mechanics before any longer training run.
 
-1. Random offloading location only, while keeping the same GCN priority order as MADDPG.
-2. Random subtask priority only, while keeping the same model/policy.
-3. Both random priority and random offloading location.
-
-Recommended choice: option 1, because it isolates whether MADDPG learns better offloading decisions than a random action policy.
+Scope:
+- inspect and test `models/maddpg.py`, `models/replay_buffer.py`, and `_update_agents_from_buffer`;
+- do not change `environment/diten_env.py`, `environment/network_env.py`, or `dataset/data_loader.py`;
+- stop after the mechanics check so the user can verify before continuing.

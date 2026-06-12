@@ -9,7 +9,10 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from run_comparision import (
+    _build_plot_results,
+    _episodes_for_algorithm,
     _format_diagnostic_summary,
+    _last_training_state_line,
     _should_print_diagnostics,
     _summarize_step_metrics,
 )
@@ -86,4 +89,81 @@ def test_short_run_diagnostics_print_only_on_final_episode() -> None:
     assert not _should_print_diagnostics(1, 10)
     assert not _should_print_diagnostics(9, 10)
     assert _should_print_diagnostics(10, 10)
-    assert _should_print_diagnostics(50, 1000)
+    assert not _should_print_diagnostics(50, 1000)
+    assert _should_print_diagnostics(500, 1000)
+
+
+def test_fixed_baselines_use_short_episode_budget() -> None:
+    """Fixed policies should not run for the full learning episode budget."""
+    assert _episodes_for_algorithm("Local Only", full_episodes=100, baseline_episodes=10) == 10
+    assert _episodes_for_algorithm("Edge Only", full_episodes=100, baseline_episodes=10) == 10
+    assert _episodes_for_algorithm("Feature Extraction Edge", full_episodes=100, baseline_episodes=10) == 10
+    assert _episodes_for_algorithm("Random Offloading", full_episodes=100, baseline_episodes=10) == 10
+    assert _episodes_for_algorithm("e-ATN-MADDPG", full_episodes=100, baseline_episodes=10) == 100
+    assert _episodes_for_algorithm("MAPPO", full_episodes=100, baseline_episodes=10) == 100
+
+
+def test_fixed_baseline_plot_results_are_mean_flat_lines() -> None:
+    """Short fixed-baseline runs should plot as mean-flat reference lines."""
+    raw_results = {
+        "reward": {
+            "Local Only": [1.0, 3.0],
+            "e-ATN-MADDPG": [0.5, 0.7, 0.9],
+        },
+        "delay": {
+            "Local Only": [2.0, 4.0],
+            "e-ATN-MADDPG": [4.0, 3.0, 2.0],
+        },
+    }
+
+    plot_results = _build_plot_results(raw_results, target_episodes=5)
+
+    assert plot_results["reward"]["Local Only"] == pytest.approx([2.0] * 5)
+    assert plot_results["delay"]["Local Only"] == pytest.approx([3.0] * 5)
+    assert plot_results["reward"]["e-ATN-MADDPG"] == pytest.approx([0.5, 0.7, 0.9])
+    assert plot_results["delay"]["e-ATN-MADDPG"] == pytest.approx([4.0, 3.0, 2.0])
+
+
+def test_last_training_state_line_is_flat_for_easy_comparison() -> None:
+    """Last-state JSONL rows should keep one model on one flat line."""
+    history = {
+        "reward": [2.1, 2.866],
+        "delay": [1.5, 1.24],
+        "energy": [0.2, 0.116],
+        "local_ratio": [90.0, 97.5],
+        "edge_ratio": [10.0, 2.5],
+        "local_time": [1.2, 1.109],
+        "server_time": [0.1, 0.007],
+        "transfer_time": [0.2, 0.008],
+        "queue_or_wait_time": [1.4, 1.357],
+        "penalty_time": [0.1, 0.0],
+        "penalty_count": [3.0, 0.0],
+        "requested_local_count": [2300.0, 2437.0],
+        "requested_edge_count": [200.0, 63.0],
+        "resolved_local_count": [2310.0, 2437.0],
+        "resolved_edge_count": [190.0, 63.0],
+    }
+
+    line = _last_training_state_line("MAPPO", history, episode_count=1000)
+
+    assert line == {
+        "model": "MAPPO",
+        "episode": 1000,
+        "reward": pytest.approx(2.866),
+        "delay_s": pytest.approx(1.24),
+        "energy_j": pytest.approx(0.116),
+        "local_count": 2437,
+        "edge_count": 63,
+        "local_ratio_percent": pytest.approx(97.5),
+        "edge_ratio_percent": pytest.approx(2.5),
+        "requested_local_count": 2437,
+        "requested_edge_count": 63,
+        "resolved_local_count": 2437,
+        "resolved_edge_count": 63,
+        "local_time_s": pytest.approx(1.109),
+        "server_time_s": pytest.approx(0.007),
+        "transfer_time_s": pytest.approx(0.008),
+        "wait_time_s": pytest.approx(1.357),
+        "penalty_count": 0,
+        "penalty_time_s": pytest.approx(0.0),
+    }

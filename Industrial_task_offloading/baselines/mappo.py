@@ -1,5 +1,8 @@
 """MAPPO baseline implementation."""
 
+from typing import List, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -64,6 +67,60 @@ class StochasticActor(nn.Module):
         x = F.relu(self.fc2(x))
         return F.softmax(self.fc3(x), dim=-1)
 
+
+class MultiAgentRolloutBuffer:
+    """Store on-policy MAPPO rollout transitions."""
+
+    def __init__(self):
+        """Initialize an empty rollout buffer."""
+        self.states: List[np.ndarray] = []
+        self.actions: List[List[int]] = []
+        self.rewards: List[List[float]] = []
+        self.next_states: List[np.ndarray] = []
+        self.old_log_probs: List[List[float]] = []
+        self.dones: List[float] = []
+
+    def push(
+        self,
+        state,
+        action: List[int],
+        reward: List[float],
+        next_state,
+        old_log_probs: List[float],
+        done: bool,
+    ) -> None:
+        """Store one on-policy joint transition."""
+        self.states.append(np.asarray(state, dtype=np.float32))
+        self.actions.append(list(action))
+        self.rewards.append(list(reward))
+        self.next_states.append(np.asarray(next_state, dtype=np.float32))
+        self.old_log_probs.append(list(old_log_probs))
+        self.dones.append(float(done))
+
+    def as_tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the rollout as tensors in insertion order."""
+        state_b = torch.FloatTensor(np.array(self.states))
+        action_b = torch.FloatTensor(np.array(self.actions))
+        reward_b = torch.FloatTensor(np.array(self.rewards))
+        next_state_b = torch.FloatTensor(np.array(self.next_states))
+        old_log_prob_b = torch.FloatTensor(np.array(self.old_log_probs))
+        done_b = torch.FloatTensor(np.array(self.dones)).unsqueeze(1)
+        return state_b, action_b, reward_b, next_state_b, old_log_prob_b, done_b
+
+    def clear(self) -> None:
+        """Remove all stored rollout transitions."""
+        self.states.clear()
+        self.actions.clear()
+        self.rewards.clear()
+        self.next_states.clear()
+        self.old_log_probs.clear()
+        self.dones.clear()
+
+    def __len__(self) -> int:
+        """Return the number of stored transitions."""
+        return len(self.states)
+
+
 class MAPPOAgent:
     """Multi-Agent PPO baseline."""
 
@@ -98,6 +155,7 @@ class MAPPOAgent:
         
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr)
+        self.last_action_log_prob = None
 
     def select_action(self, state: torch.Tensor) -> int:
         """Sample an action from the policy distribution.
@@ -108,11 +166,25 @@ class MAPPOAgent:
         Returns:
             Selected action index.
         """
+        action, log_prob = self.select_action_with_log_prob(state)
+        self.last_action_log_prob = log_prob
+        return action
+
+    def select_action_with_log_prob(self, state: torch.Tensor) -> Tuple[int, float]:
+        """Sample an action and return its old policy log-probability.
+
+        Args:
+            state: Per-agent state tensor.
+
+        Returns:
+            Tuple of selected action index and log-probability.
+        """
         with torch.no_grad():
             probs = self.actor(state)
             distribution = Categorical(probs)
             action = distribution.sample()
-            return action.item()
+            log_prob = distribution.log_prob(action)
+            return action.item(), float(log_prob.item())
 
     def update_agent(
         self,
@@ -121,6 +193,8 @@ class MAPPOAgent:
         reward_b: torch.Tensor,
         next_state_b: torch.Tensor,
         agent_index: int,
+        old_log_prob_b: torch.Tensor | None = None,
+        done_b: torch.Tensor | None = None,
     ) -> None:
         """Update agent parameters using a batch of experiences.
 
@@ -130,31 +204,36 @@ class MAPPOAgent:
             reward_b: Batched joint rewards.
             next_state_b: Batched next joint states.
             agent_index: Index of the agent being updated.
+            old_log_prob_b: Batched old action log-probabilities from rollout collection.
+            done_b: Batched terminal flags.
         """
         
-        # --- FIX 1: Dẹt (flatten) state_b và next_state_b ---
         batch_size = state_b.size(0)
         joint_state_b = state_b.view(batch_size, -1)
         joint_next_state_b = next_state_b.view(batch_size, -1)
 
         agent_rewards = reward_b[:, agent_index].unsqueeze(1)
         agent_states = state_b[:, agent_index, :]
-        # --- FIX 2: Ép kiểu action sang .long() ---
         agent_actions = action_b[:, agent_index].long() 
+        done_mask = done_b if done_b is not None else torch.zeros_like(agent_rewards)
         
         # 1. Calculate Advantages and Old Log Probs (Detached)
         with torch.no_grad():
-            # Sử dụng joint_state cho critic
             next_v = self.critic(joint_next_state_b)
-            target_v = agent_rewards + self.gamma * next_v
+            target_v = agent_rewards + self.gamma * next_v * (1.0 - done_mask)
             current_v = self.critic(joint_state_b)
             
             advantages = target_v - current_v
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            advantages = (advantages - advantages.mean()) / (
+                advantages.std(unbiased=False) + 1e-8
+            )
             
-            probs = self.actor(agent_states)
-            distribution = Categorical(probs)
-            old_log_probs = distribution.log_prob(agent_actions)
+            if old_log_prob_b is None:
+                probs = self.actor(agent_states)
+                distribution = Categorical(probs)
+                old_log_probs = distribution.log_prob(agent_actions)
+            else:
+                old_log_probs = old_log_prob_b[:, agent_index]
             
         # 2. PPO Epochs
         for _ in range(self.ppo_epochs):

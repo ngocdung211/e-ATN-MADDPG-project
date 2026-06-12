@@ -80,16 +80,16 @@ class KolektorSDDLoader:
             },
             "subtask_3": {  # Standardization
                 "data_size": raw_bits,
-                "result_size": raw_bits * 0.6,
+                "result_size": raw_bits * 0.3,
                 "cpu_cycles": pixels * 50,
             },
             "subtask_4": {  # Feature Extraction
                 "data_size": raw_bits * 0.6,
                 "result_size": file_size_bits * 0.1,
-                "cpu_cycles": pixels * 700,
+                "cpu_cycles": pixels * 500,
             },
             "subtask_5": {  # Detection and Recognition
-                "data_size": file_size_bits * 0.1,
+                "data_size": file_size_bits * 0.03,
                 "result_size": 256,
                 "cpu_cycles": pixels * 150,
             },

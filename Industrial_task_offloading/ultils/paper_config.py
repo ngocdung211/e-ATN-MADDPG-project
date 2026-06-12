@@ -16,13 +16,13 @@ PAPER_PARAMS: Dict[str, Dict[str, float]] = {
         "time_slots": 50,
         "slot_duration_s": 1.0,
         "device_speed_mps": 1.0,
-        "coverage_radius_m": 12.0,
+        "coverage_radius_m": 20.0,
         # Communication / system
         "bandwidth_hz": 10e6,
         "noise_power_dbm": -43,
         "device_tx_power_w": 0.5,
         "server_tx_power_w": 1.2,
-        "device_energy_coeff": 1e-28,
+        "device_energy_coeff": 2.5e-28,
         "server_energy_coeff": 1e-27,
         # Learning settings confirmed in paper text
         "gcn_hidden_dim": 32,

@@ -1,0 +1,115 @@
+"""Tests for topology graph attention encoding."""
+
+import pathlib
+import sys
+
+import torch
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from models.topology_gat import TopologyGATEncoder
+from ultils.topology_graph_state import build_topology_graph_state
+
+
+def _make_joint_state() -> torch.Tensor:
+    """Create a two-device, two-server flat state with valid graph links."""
+    return torch.tensor(
+        [
+            [
+                1.0,
+                0.1,
+                0.5,
+                0.2,
+                0.05,
+                0.2,
+                0.4,
+                0.6,
+                0.8,
+                1.0,
+                2.3,
+                2.5,
+                0.1,
+                0.2,
+                0.0,
+                1.0,
+                0.8,
+                1.0,
+            ],
+            [
+                0.9,
+                0.3,
+                0.7,
+                0.4,
+                0.06,
+                0.2,
+                0.4,
+                0.6,
+                0.8,
+                1.0,
+                2.3,
+                2.5,
+                0.1,
+                0.2,
+                1.0,
+                0.25,
+                1.0,
+                0.75,
+            ],
+        ],
+        dtype=torch.float32,
+    )
+
+
+def test_topology_gat_encoder_returns_device_embeddings() -> None:
+    """Encoder output should contain one embedding per device node."""
+    graph_state = build_topology_graph_state(
+        _make_joint_state(), num_devices=2, num_servers=2
+    )
+    encoder = TopologyGATEncoder(
+        node_feature_dim=9,
+        edge_feature_dim=5,
+        hidden_dim=16,
+        embedding_dim=8,
+    )
+
+    device_embeddings = encoder(
+        graph_state.node_features,
+        graph_state.edge_index,
+        graph_state.edge_features,
+        graph_state.device_node_indices,
+    )
+
+    assert device_embeddings.shape == (2, 8)
+    assert torch.isfinite(device_embeddings).all()
+
+
+def test_topology_gat_encoder_backpropagates_gradients() -> None:
+    """A loss on device embeddings should update GAT encoder parameters."""
+    graph_state = build_topology_graph_state(
+        _make_joint_state(), num_devices=2, num_servers=2
+    )
+    encoder = TopologyGATEncoder(
+        node_feature_dim=9,
+        edge_feature_dim=5,
+        hidden_dim=16,
+        embedding_dim=8,
+    )
+
+    device_embeddings = encoder(
+        graph_state.node_features,
+        graph_state.edge_index,
+        graph_state.edge_features,
+        graph_state.device_node_indices,
+    )
+    loss = device_embeddings.pow(2).mean()
+    loss.backward()
+
+    gradients = [
+        parameter.grad
+        for parameter in encoder.parameters()
+        if parameter.requires_grad
+    ]
+    assert gradients
+    assert all(gradient is not None for gradient in gradients)
+    assert any(torch.any(gradient != 0.0) for gradient in gradients)
