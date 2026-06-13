@@ -1,6 +1,6 @@
 # Paper Reimplementation Plan and Checklist
 
-**Goal:** Reimplement the paper environment and MADDPG path with minimum code changes, then compare MADDPG against local-only, edge-only, and random baselines.
+**Goal:** Reimplement the paper environment and MADDPG path with minimum code changes, then compare trained DRL models against the currently enabled comparison baselines.
 
 **Success criteria:**
 - The environment follows the paper's task, mobility, communication, computation, MDP state, action, reward, and constraint definitions closely enough that training results are meaningful.
@@ -19,8 +19,8 @@
 What is now implemented:
 - [x] Local-only baseline.
 - [x] Edge-only baseline.
-- [x] Random offloading baseline.
-- [x] Feature-extraction-only edge baseline.
+- [x] Random offloading baseline implemented, but not required/enabled for the current long-run comparison.
+- [x] Feature-extraction-only edge baseline implemented, but not required/enabled for the current long-run comparison.
 - [x] Timing diagnostics for local compute time, successful server compute time, attempted server compute time, transfer time, wait time, penalty count, and penalty time.
 - [x] Action diagnostics for requested local/edge counts and actual resolved local/edge counts.
 - [x] Readable comparison output for short runs, printed only on the final episode.
@@ -32,6 +32,7 @@ What is now implemented:
 - [x] Experiment parameters are centralized in `ultils/paper_config.py` for the active comparison runner, including reward weights, penalties, estimation errors, GCN pretraining size, compute-power ranges, episode budgets, MAPPO settings, and Graph-GAT settings.
 - [x] `t_max` and `e_max` from `PAPER_PARAMS` are passed into GCN DAG sampling and per-episode task DAG generation in `run_comparision.py`.
 - [x] MAPPO and Graph-GAT MAPPO action masks can be turned on/off from `ultils/paper_config.py`.
+- [x] Trainable model checkpoints are saved into the same plot folder as images and last-state JSONL for later evaluation without retraining.
 
 Current output should now look like:
 
@@ -130,11 +131,17 @@ Stop after each task and wait for user verification.
      - action distribution does not collapse immediately without explanation.
      - if reward is flat, inspect actor/critic losses before changing reward/env.
 
-7. [ ] **Compare e-ATN-MADDPG against simple baselines only after smoke passes**
+7. [ ] **Compare e-ATN-MADDPG against enabled baselines only after smoke passes**
    - Goal: Check trend direction, not exact paper numbers.
-   - Compare against:
+   - Currently enabled comparison set:
      - Local Only
      - Edge Only
+     - MAPPO
+     - Graph-GAT MAPPO
+     - e-ATN-MADDPG
+     - MADDPG
+     - MAAC
+   - Implemented but currently disabled/not required:
      - Feature Extraction Edge
      - Random Offloading
    - Verify:
@@ -306,7 +313,7 @@ Stop after each small task and wait for user verification.
       - Graph-GAT MAPPO proposal.
       - optional Graph-GAT e-ATN-MADDPG only after separate smoke tests.
     - Verify:
-      - plots and JSONL include each model as separate lines.
+      - plots, checkpoints, and JSONL include each enabled model as separate outputs.
       - result summary clearly states this is a proposed graph-state encoder ablation, not the original paper model.
 
 ---

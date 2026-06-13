@@ -4,7 +4,7 @@ This script trains multiple algorithms on the DITEN environment and
 generates plots and JSON summaries for reward, delay, and energy.
 """
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -73,28 +73,6 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
         "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
         # "Feature Extraction Edge": {"class": FeatureExtractionEdgeAgent, "kwargs": {}},
         # "Random Offloading": {"class": RandomOffloadingAgent, "kwargs": {}},
-        "MAPPO": {
-            "class": MAPPOAgent,
-            "kwargs": {
-                "lr": confirmed["rl_lr"],
-                "gamma": provisional["gamma"],
-                "clip_param": provisional["mappo_clip_param"],
-                "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
-                "use_action_mask": provisional["mappo_use_action_mask"],
-            },
-        },
-        "Graph-GAT MAPPO": {
-            "class": GraphGATMAPPOAgent,
-            "kwargs": {
-                "lr": confirmed["rl_lr"],
-                "gamma": provisional["gamma"],
-                "hidden_dim": int(provisional["graph_gat_hidden_dim"]),
-                "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
-                "clip_param": provisional["graph_gat_clip_param"],
-                "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
-                "use_action_mask": provisional["graph_gat_use_action_mask"],
-            },
-        },
         "e-ATN-MADDPG": {
             "class": EpsilonATNMADDPGAgent,
             "kwargs": {
@@ -106,18 +84,40 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "decay": provisional["epsilon_decay"],
             },
         },
-        "MADDPG": {
-            "class": EpsilonATNMADDPGAgent,
-            "kwargs": {
-                "use_attention": False,
-                "use_epsilon_greedy": False,
-                "lr": confirmed["rl_lr"],
-                "epsilon_init": provisional["epsilon_init"],
-                "epsilon_min": provisional["epsilon_min"],
-                "decay": provisional["epsilon_decay"],
-            },
-        },
-        "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        # "MADDPG": {
+        #     "class": EpsilonATNMADDPGAgent,
+        #     "kwargs": {
+        #         "use_attention": False,
+        #         "use_epsilon_greedy": False,
+        #         "lr": confirmed["rl_lr"],
+        #         "epsilon_init": provisional["epsilon_init"],
+        #         "epsilon_min": provisional["epsilon_min"],
+        #         "decay": provisional["epsilon_decay"],
+        #     },
+        # },
+        # "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        # "MAPPO": {
+        #     "class": MAPPOAgent,
+        #     "kwargs": {
+        #         "lr": confirmed["rl_lr"],
+        #         "gamma": provisional["gamma"],
+        #         "clip_param": provisional["mappo_clip_param"],
+        #         "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
+        #         "use_action_mask": provisional["mappo_use_action_mask"],
+        #     },
+        # },
+        # "Graph-GAT MAPPO": {
+        #     "class": GraphGATMAPPOAgent,
+        #     "kwargs": {
+        #         "lr": confirmed["rl_lr"],
+        #         "gamma": provisional["gamma"],
+        #         "hidden_dim": int(provisional["graph_gat_hidden_dim"]),
+        #         "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
+        #         "clip_param": provisional["graph_gat_clip_param"],
+        #         "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+        #         "use_action_mask": provisional["graph_gat_use_action_mask"],
+        #     },
+        # },
 
     }
 
@@ -195,6 +195,93 @@ def _write_last_training_state_jsonl(
     with open(output_path, "w", encoding="utf-8") as output_file:
         for row in rows:
             output_file.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def _safe_checkpoint_name(algo_name: str) -> str:
+    """Return a filesystem-safe checkpoint name for an algorithm."""
+    safe_name = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "_"
+        for char in algo_name
+    ).strip("_")
+    return safe_name or "model"
+
+
+def _agent_checkpoint_state(agent: object, agent_index: int) -> Dict[str, object]:
+    """Build checkpoint state for one trainable agent."""
+    agent_state: Dict[str, object] = {
+        "agent_index": int(agent_index),
+        "agent_class": agent.__class__.__name__,
+    }
+    for module_name in ("encoder", "actor", "critic", "target_actor", "target_critic"):
+        module = getattr(agent, module_name, None)
+        if module is not None and hasattr(module, "state_dict"):
+            agent_state[module_name] = module.state_dict()
+
+    optimizer_states = {}
+    for optimizer_name in ("optimizer", "actor_optimizer", "critic_optimizer"):
+        optimizer = getattr(agent, optimizer_name, None)
+        if optimizer is not None and hasattr(optimizer, "state_dict"):
+            optimizer_states[optimizer_name] = optimizer.state_dict()
+    if optimizer_states:
+        agent_state["optimizers"] = optimizer_states
+
+    return agent_state
+
+
+def _build_model_checkpoint(
+    algo_name: str,
+    agents: Sequence[object],
+    agent_config: Dict[str, object],
+    history: Dict[str, List[float]],
+    episode_count: int,
+    state_dim: int,
+    action_dim: int,
+    num_devices: int,
+    num_servers: int,
+    graph_node_feature_dim: Optional[int] = None,
+    graph_edge_feature_dim: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a serializable checkpoint payload for a trainable algorithm."""
+    agent_states = [
+        _agent_checkpoint_state(agent, agent_index)
+        for agent_index, agent in enumerate(agents)
+    ]
+    trainable_agent_states = [
+        agent_state
+        for agent_state in agent_states
+        if any(key in agent_state for key in ("encoder", "actor", "critic"))
+    ]
+    if not trainable_agent_states:
+        return None
+
+    agent_class = agent_config.get("class")
+    checkpoint: Dict[str, Any] = {
+        "model": algo_name,
+        "episode_count": int(episode_count),
+        "agent_class": getattr(agent_class, "__name__", str(agent_class)),
+        "agent_kwargs": dict(agent_config.get("kwargs", {})),
+        "state_dim": int(state_dim),
+        "action_dim": int(action_dim),
+        "num_devices": int(num_devices),
+        "num_servers": int(num_servers),
+        "agents": trainable_agent_states,
+        "final_metrics": _last_training_state_line(algo_name, history, episode_count),
+    }
+    if graph_node_feature_dim is not None or graph_edge_feature_dim is not None:
+        checkpoint["graph_dims"] = {
+            "node_feature_dim": graph_node_feature_dim,
+            "edge_feature_dim": graph_edge_feature_dim,
+        }
+    return checkpoint
+
+
+def _save_model_checkpoint(save_dir: str, checkpoint: Dict[str, Any]) -> str:
+    """Save one model checkpoint into a plot output directory."""
+    os.makedirs(save_dir, exist_ok=True)
+    safe_name = _safe_checkpoint_name(str(checkpoint["model"]))
+    checkpoint_path = os.path.join(save_dir, f"{safe_name}_checkpoint.pt")
+    torch.save(checkpoint, checkpoint_path)
+    return checkpoint_path
 
 
 def build_priorities_by_mode(
@@ -508,8 +595,8 @@ def train_algorithm(
     gcn_model: TaskPriorityGCN,
     num_episodes: int,
     priority_mode: str = "gcn",
-) -> Dict[str, List[float]]:
-    """Train one algorithm configuration and return metric histories.
+) -> Tuple[Dict[str, List[float]], Optional[Dict[str, Any]]]:
+    """Train one algorithm configuration and return metrics and checkpoint.
 
     Args:
         algo_name: Display name for logging.
@@ -523,7 +610,7 @@ def train_algorithm(
         priority_mode: Scheduling mode ("gcn", "random", "greedy").
 
     Returns:
-        Dict with reward, delay, energy, local_ratio, and edge_ratio histories.
+        Tuple of metric history and optional trainable model checkpoint payload.
     """
     print(f"\n{'='*50}\nStarting Training for: {algo_name}\n{'='*50}")
     set_seed(42)  # Reset seed for fair comparison
@@ -859,7 +946,20 @@ def train_algorithm(
                     f"| Transitions: {history['graph_transition_count'][-1]:.0f}"
                 )
             
-    return history
+    checkpoint = _build_model_checkpoint(
+        algo_name=algo_name,
+        agents=agents,
+        agent_config=agent_config,
+        history=history,
+        episode_count=num_episodes,
+        state_dim=STATE_DIM,
+        action_dim=ACTION_DIM,
+        num_devices=len(devices),
+        num_servers=len(servers),
+        graph_node_feature_dim=graph_node_feature_dim if uses_graph_gat_mappo else None,
+        graph_edge_feature_dim=graph_edge_feature_dim if uses_graph_gat_mappo else None,
+    )
+    return history, checkpoint
 
 if __name__ == "__main__":
     # 1. Base Environment Setup
@@ -945,6 +1045,7 @@ if __name__ == "__main__":
     BASELINE_EVALUATION_EPISODES = int(provisional["baseline_evaluation_episodes"])
     algorithm_episode_counts = {}
     last_training_state_rows = []
+    model_checkpoints = []
 
     # Fig.6-style priority extraction comparison under fixed e-ATN-MADDPG.
     priority_modes = {"Random Scheduling": "random", "Greedy Scheduling": "greedy", "GCN Scheduling": "gcn"}
@@ -983,7 +1084,7 @@ if __name__ == "__main__":
             baseline_episodes=BASELINE_EVALUATION_EPISODES,
         )
         algorithm_episode_counts[algo_name] = run_episodes
-        history = train_algorithm(
+        history, checkpoint = train_algorithm(
             algo_name,
             config,
             devices,
@@ -1000,6 +1101,8 @@ if __name__ == "__main__":
         last_training_state_rows.append(
             _last_training_state_line(algo_name, history, episode_count=run_episodes)
         )
+        if checkpoint is not None:
+            model_checkpoints.append(checkpoint)
 
     # 4. Plotting Results
     print("\nAll training complete! Generating comparison plots...")
@@ -1007,7 +1110,7 @@ if __name__ == "__main__":
     plot_results = _build_plot_results(results, target_episodes=FULL_EPISODES)
     
     # Plot Reward (Like Fig. 8)
-    date_string = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    date_string = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
     plotter.plot_training_curve(
         data_dict=plot_results["reward"], 
         title="Performance Comparison in Reward", 
@@ -1042,5 +1145,13 @@ if __name__ == "__main__":
         plotter.save_dir, f"{date_string}_last_training_state.jsonl"
     )
     _write_last_training_state_jsonl(last_state_path, last_training_state_rows)
+    checkpoint_paths = [
+        _save_model_checkpoint(plotter.save_dir, checkpoint)
+        for checkpoint in model_checkpoints
+    ]
     
     print(f"Plots and last training states saved successfully! JSONL: {last_state_path}")
+    if checkpoint_paths:
+        print("Model checkpoints saved:")
+        for checkpoint_path in checkpoint_paths:
+            print(f"  {checkpoint_path}")

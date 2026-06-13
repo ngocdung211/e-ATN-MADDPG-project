@@ -16,7 +16,7 @@ PAPER_PARAMS: Dict[str, Dict[str, float]] = {
         "time_slots": 50,
         "slot_duration_s": 1.0,
         "device_speed_mps": 1.0,
-        "coverage_radius_m": 20.0,
+        "coverage_radius_m": 12.0,
         # Communication / system
         "bandwidth_hz": 10e6,
         "noise_power_dbm": -43,
@@ -35,7 +35,7 @@ PAPER_PARAMS: Dict[str, Dict[str, float]] = {
         "gamma": 0.99,
         "batch_size": 64,
         "replay_buffer_capacity": 100000,
-        "comparison_full_episodes": 50,
+        "comparison_full_episodes": 300,
         "baseline_evaluation_episodes": 5,
         "subslot_count": 200,
         "lambda1": 1.0,

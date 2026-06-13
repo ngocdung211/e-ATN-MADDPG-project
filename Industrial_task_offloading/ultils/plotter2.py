@@ -74,7 +74,8 @@ class DITENPlotter2:
         
         # Save the plot
         
-        date_string = time.strftime("%Y-%m-%d %H", time.localtime())
+        date_string = time.strftime("%Y-%m-%d_%H", time.localtime())
+        # folder = os.join('plots',date_string)
         os.makedirs(f"plots/{date_string}", exist_ok=True)
         self.save_dir = f"plots/{date_string}"
         filepath = os.path.join(self.save_dir, filename)

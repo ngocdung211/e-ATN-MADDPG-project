@@ -4,15 +4,20 @@ import pathlib
 import sys
 
 import pytest
+import torch
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from baselines.mappo import MAPPOAgent
+from baselines.offloading_baselines import LocalOnlyAgent
 from run_comparision import (
     _build_plot_results,
+    _build_model_checkpoint,
     _episodes_for_algorithm,
     _format_diagnostic_summary,
     _last_training_state_line,
+    _save_model_checkpoint,
     _should_print_diagnostics,
     _summarize_step_metrics,
     build_algorithm_configs,
@@ -196,3 +201,64 @@ def test_last_training_state_line_is_flat_for_easy_comparison() -> None:
         "penalty_count": 0,
         "penalty_time_s": pytest.approx(0.0),
     }
+
+
+def test_fixed_baseline_does_not_create_model_checkpoint() -> None:
+    """Rule-based baselines should not save empty model checkpoints."""
+    agent = LocalOnlyAgent(state_dim=4, action_dim=3, num_agents=1)
+
+    checkpoint = _build_model_checkpoint(
+        algo_name="Local Only",
+        agents=[agent],
+        agent_config={"class": LocalOnlyAgent, "kwargs": {}},
+        history={"reward": [1.0]},
+        episode_count=5,
+        state_dim=4,
+        action_dim=3,
+        num_devices=1,
+        num_servers=2,
+    )
+
+    assert checkpoint is None
+
+
+def test_mappo_checkpoint_contains_agent_weights_and_metadata() -> None:
+    """Trainable checkpoints should include weights, config, and dimensions."""
+    agent = MAPPOAgent(state_dim=4, action_dim=3, num_agents=1)
+
+    checkpoint = _build_model_checkpoint(
+        algo_name="MAPPO",
+        agents=[agent],
+        agent_config={"class": MAPPOAgent, "kwargs": {"lr": 0.0001}},
+        history={"reward": [1.0], "delay": [0.5]},
+        episode_count=5,
+        state_dim=4,
+        action_dim=3,
+        num_devices=1,
+        num_servers=2,
+    )
+
+    assert checkpoint is not None
+    assert checkpoint["model"] == "MAPPO"
+    assert checkpoint["episode_count"] == 5
+    assert checkpoint["state_dim"] == 4
+    assert checkpoint["action_dim"] == 3
+    assert checkpoint["num_devices"] == 1
+    assert checkpoint["num_servers"] == 2
+    assert checkpoint["agent_class"] == "MAPPOAgent"
+    assert checkpoint["agent_kwargs"] == {"lr": 0.0001}
+    assert len(checkpoint["agents"]) == 1
+    assert "actor" in checkpoint["agents"][0]
+    assert "critic" in checkpoint["agents"][0]
+    assert checkpoint["final_metrics"]["reward"] == pytest.approx(1.0)
+
+
+def test_save_model_checkpoint_writes_safe_filename(tmp_path) -> None:
+    """Checkpoint files should be saved with readable safe names."""
+    checkpoint = {"model": "Graph-GAT MAPPO", "episode_count": 5}
+
+    checkpoint_path = _save_model_checkpoint(str(tmp_path), checkpoint)
+
+    assert checkpoint_path.endswith("Graph-GAT_MAPPO_checkpoint.pt")
+    loaded = torch.load(checkpoint_path, map_location="cpu")
+    assert loaded["model"] == "Graph-GAT MAPPO"
