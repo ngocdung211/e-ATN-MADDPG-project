@@ -13,6 +13,7 @@ import random
 import json
 import os
 from tqdm import trange
+from baselines.graph_gat_mappo import GraphGATMAPPOAgent, GraphGATRolloutBuffer
 from baselines.maac import MAACAgent
 from baselines.mappo import MAPPOAgent, MultiAgentRolloutBuffer
 from baselines.offloading_baselines import (
@@ -34,6 +35,7 @@ from ultils.plotter2 import DITENPlotter2
 from ultils.gcn_training import load_or_train_gcn
 from ultils.experiment_setup import build_priorities, generate_task_dags_for_episode, make_gcn_dag_sampler
 from ultils.paper_config import PAPER_PARAMS
+from ultils.topology_graph_state import TopologyGraphState, build_topology_graph_state
 import time
 
 
@@ -67,10 +69,32 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
     confirmed = PAPER_PARAMS["confirmed"]
     provisional = PAPER_PARAMS["provisional_table2_needed"]
     return {
-        # "Local Only": {"class": LocalOnlyAgent, "kwargs": {}},
-        # "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
+        "Local Only": {"class": LocalOnlyAgent, "kwargs": {}},
+        "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
         # "Feature Extraction Edge": {"class": FeatureExtractionEdgeAgent, "kwargs": {}},
         # "Random Offloading": {"class": RandomOffloadingAgent, "kwargs": {}},
+        "MAPPO": {
+            "class": MAPPOAgent,
+            "kwargs": {
+                "lr": confirmed["rl_lr"],
+                "gamma": provisional["gamma"],
+                "clip_param": provisional["mappo_clip_param"],
+                "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
+                "use_action_mask": provisional["mappo_use_action_mask"],
+            },
+        },
+        "Graph-GAT MAPPO": {
+            "class": GraphGATMAPPOAgent,
+            "kwargs": {
+                "lr": confirmed["rl_lr"],
+                "gamma": provisional["gamma"],
+                "hidden_dim": int(provisional["graph_gat_hidden_dim"]),
+                "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
+                "clip_param": provisional["graph_gat_clip_param"],
+                "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+                "use_action_mask": provisional["graph_gat_use_action_mask"],
+            },
+        },
         "e-ATN-MADDPG": {
             "class": EpsilonATNMADDPGAgent,
             "kwargs": {
@@ -82,8 +106,18 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "decay": provisional["epsilon_decay"],
             },
         },
+        "MADDPG": {
+            "class": EpsilonATNMADDPGAgent,
+            "kwargs": {
+                "use_attention": False,
+                "use_epsilon_greedy": False,
+                "lr": confirmed["rl_lr"],
+                "epsilon_init": provisional["epsilon_init"],
+                "epsilon_min": provisional["epsilon_min"],
+                "decay": provisional["epsilon_decay"],
+            },
+        },
         "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
-        "MAPPO": {"class": MAPPOAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
 
     }
 
@@ -226,6 +260,48 @@ def _collect_joint_actions(
     return joint_actions, local_count, edge_count
 
 
+def _collect_graph_gat_actions(
+    agent: GraphGATMAPPOAgent,
+    joint_state: np.ndarray,
+    num_devices: int,
+    num_servers: int,
+) -> Tuple[List[int], int, int, List[float], TopologyGraphState, float, float]:
+    """Build graph state and select Graph-GAT MAPPO joint actions.
+
+    Args:
+        agent: Shared Graph-GAT MAPPO controller.
+        joint_state: Joint flat state array shaped `(num_devices, state_dim)`.
+        num_devices: Number of device agents.
+        num_servers: Number of edge servers.
+
+    Returns:
+        Joint actions, local count, edge count, old log-probs, graph state, graph
+        build time, and action selection time.
+    """
+    graph_build_start = time.perf_counter()
+    graph_state = build_topology_graph_state(
+        torch.as_tensor(joint_state, dtype=torch.float32),
+        num_devices=num_devices,
+        num_servers=num_servers,
+    )
+    graph_build_time = time.perf_counter() - graph_build_start
+
+    graph_action_start = time.perf_counter()
+    joint_actions, old_log_probs = agent.select_actions_with_log_probs(graph_state)
+    graph_action_time = time.perf_counter() - graph_action_start
+    local_count = sum(1 for action in joint_actions if action == 0)
+    edge_count = len(joint_actions) - local_count
+    return (
+        joint_actions,
+        local_count,
+        edge_count,
+        old_log_probs,
+        graph_state,
+        graph_build_time,
+        graph_action_time,
+    )
+
+
 def _summarize_step_metrics(step_metrics: Sequence[Dict[str, float]]) -> Dict[str, float]:
     """Summarize timing diagnostics from environment step metrics.
 
@@ -291,7 +367,7 @@ def _format_diagnostic_summary(algo_name: str, episode_number: int, history: Dic
     transfer_time = history["transfer_time"][-1]
     wait_time = history["queue_or_wait_time"][-1]
 
-    return (
+    summary = (
         f"[{algo_name}] Episode {episode_number} diagnostics\n"
         f"  Requested actions: local={requested_local:.0f} edge={requested_edge:.0f}\n"
         f"  Actual execution:  local={resolved_local:.0f} edge={resolved_edge:.0f}\n"
@@ -299,11 +375,22 @@ def _format_diagnostic_summary(algo_name: str, episode_number: int, history: Dic
         f"  Timing avg/step:   local={local_time:.3f}s server={server_time:.3f}s "
         f"transfer={transfer_time:.3f}s wait={wait_time:.3f}s"
     )
+    graph_transition_count = history.get("graph_transition_count", [0.0])[-1]
+    if graph_transition_count > 0:
+        graph_build_time = history["graph_build_time"][-1]
+        graph_action_time = history["graph_action_time"][-1]
+        graph_update_time = history["graph_update_time"][-1]
+        summary += (
+            f"\n  Graph-GAT cost:    build={graph_build_time:.3f}s "
+            f"action={graph_action_time:.3f}s update={graph_update_time:.3f}s "
+            f"transitions={graph_transition_count:.0f}"
+        )
+    return summary
 
 
 def _should_print_diagnostics(episode_number: int, num_episodes: int) -> bool:
     """Return whether to print readable diagnostics for this episode."""
-    return episode_number == num_episodes or episode_number % 500 == 0 or episode_number == 1
+    return episode_number == num_episodes or episode_number % 500 == 0
 
 
 def _update_agents_from_buffer(
@@ -396,6 +483,21 @@ def _update_agents_from_rollout(
     rollout_buffer.clear()
 
 
+def _update_graph_gat_mappo_from_rollout(
+    agent: GraphGATMAPPOAgent,
+    rollout_buffer: GraphGATRolloutBuffer,
+    gamma: float,
+) -> float:
+    """Update Graph-GAT MAPPO from graph rollouts and return update time."""
+    if len(rollout_buffer) == 0:
+        return 0.0
+
+    agent.gamma = gamma
+    update_start = time.perf_counter()
+    agent.update_from_rollout(rollout_buffer)
+    return time.perf_counter() - update_start
+
+
 def train_algorithm(
     algo_name: str,
     agent_config: Dict[str, object],
@@ -434,36 +536,56 @@ def train_algorithm(
         servers,
         network_env,
         slot_duration=confirmed["slot_duration_s"],
-        subslot_count=200,
+        subslot_count=int(provisional["subslot_count"]),
         time_slots=time_slots,
-        lambda1=2,
-        lambda2=3,
-        lambda3=0.8,
-        lambda4=1.2,
-        lambda5=1,
-        p_out_value=-0.7,
-        local_estimation_error=0.2,
-        edge_estimation_error=0.1,
+        lambda1=provisional["lambda1"],
+        lambda2=provisional["lambda2"],
+        lambda3=provisional["lambda3"],
+        lambda4=provisional["lambda4"],
+        lambda5=provisional["lambda5"],
+        p_out_value=provisional["p_out_value"],
+        local_estimation_error=provisional["local_estimation_error"],
+        edge_estimation_error=provisional["edge_estimation_error"],
     )
     # State/Action dimensions
     STATE_DIM = env.get_state_dim()
     ACTION_DIM = 1 + len(servers)
+    graph_priority_width = STATE_DIM - (5 + 4 * len(servers))
+    graph_node_feature_dim = 9 + graph_priority_width
+    graph_edge_feature_dim = 7
     # JOINT_STATE_DIM = STATE_DIM * len(devices)
     # JOINT_ACTION_DIM = len(devices)
     
     # Initialize Agents dynamically based on the config
+    agent_class = agent_config["class"]
+    uses_graph_gat_mappo = agent_class is GraphGATMAPPOAgent
     agents: List[object] = []
-    for _ in range(len(devices)):
-        agent = agent_config["class"](
-            state_dim=STATE_DIM, action_dim=ACTION_DIM, 
-            num_agents= len(devices),
-            **agent_config.get("kwargs", {})
+    if uses_graph_gat_mappo:
+        agents.append(
+            agent_class(
+                num_devices=len(devices),
+                num_servers=len(servers),
+                node_feature_dim=graph_node_feature_dim,
+                edge_feature_dim=graph_edge_feature_dim,
+                **agent_config.get("kwargs", {}),
+            )
         )
-        agents.append(agent)
+    else:
+        for _ in range(len(devices)):
+            agent = agent_class(
+                state_dim=STATE_DIM, action_dim=ACTION_DIM,
+                num_agents=len(devices),
+                **agent_config.get("kwargs", {})
+            )
+            agents.append(agent)
 
     replay_buffer = MultiAgentReplayBuffer(capacity=int(provisional["replay_buffer_capacity"]))
     rollout_buffer = MultiAgentRolloutBuffer()
-    uses_rollout_buffer = all(hasattr(agent, "select_action_with_log_prob") for agent in agents)
+    graph_rollout_buffer = GraphGATRolloutBuffer()
+    uses_rollout_buffer = (
+        not uses_graph_gat_mappo
+        and all(hasattr(agent, "select_action_with_log_prob") for agent in agents)
+    )
     batch_size = int(provisional["batch_size"])
     gamma = provisional["gamma"]
     
@@ -485,6 +607,10 @@ def train_algorithm(
         "requested_edge_count": [],
         "resolved_local_count": [],
         "resolved_edge_count": [],
+        "graph_build_time": [],
+        "graph_action_time": [],
+        "graph_update_time": [],
+        "graph_transition_count": [],
     }
 
     episode_iterator = trange(num_episodes, desc=f"Training {algo_name}", leave=True)
@@ -506,6 +632,10 @@ def train_algorithm(
         slot_requested_edge_counts = []
         slot_resolved_local_counts = []
         slot_resolved_edge_counts = []
+        episode_graph_build_time = 0.0
+        episode_graph_action_time = 0.0
+        episode_graph_update_time = 0.0
+        episode_graph_transition_count = 0.0
 
         episode_done = False
         for _ in range(time_slots):
@@ -517,15 +647,38 @@ def train_algorithm(
             slot_steps = 0
             prev_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
             prev_energy_mean = np.mean(list(env.device_accumulated_energy.values()))
-            task_dags = generate_task_dags_for_episode(devices, data_loader)
+            task_dags = generate_task_dags_for_episode(
+                devices,
+                data_loader,
+                t_max=provisional["t_max"],
+                e_max=provisional["e_max"],
+            )
             priorities = build_priorities_by_mode(task_dags, gcn_model, priority_mode)
 
             current_joint_state = env.start_time_slot(task_dags, priorities)
             slot_done = False
             while not slot_done and not episode_done:
-                joint_actions, local_count, edge_count = _collect_joint_actions(
-                    agents, current_joint_state, env
-                )
+                if uses_graph_gat_mappo:
+                    (
+                        joint_actions,
+                        local_count,
+                        edge_count,
+                        old_log_probs,
+                        graph_state,
+                        graph_build_time,
+                        graph_action_time,
+                    ) = _collect_graph_gat_actions(
+                        agent=agents[0],
+                        joint_state=current_joint_state,
+                        num_devices=len(devices),
+                        num_servers=len(servers),
+                    )
+                    episode_graph_build_time += graph_build_time
+                    episode_graph_action_time += graph_action_time
+                else:
+                    joint_actions, local_count, edge_count = _collect_joint_actions(
+                        agents, current_joint_state, env
+                    )
                 count_local += local_count
                 count_edge += edge_count
                 slot_local += local_count
@@ -536,7 +689,7 @@ def train_algorithm(
                 slot_done = info.get("slot_done", False)
                 episode_done = step_episode_done
                 # Aggregate team reward as average per-agent immediate reward.
-                step_reward = sum(joint_rewards) / len(agents)
+                step_reward = sum(joint_rewards) / len(devices)
                 slot_reward += step_reward
                 slot_steps += 1
                 slot_local_times.append(metric_summary["local_time"])
@@ -550,7 +703,26 @@ def train_algorithm(
                 slot_requested_edge_counts.append(metric_summary["requested_edge_count"])
                 slot_resolved_local_counts.append(metric_summary["resolved_local_count"])
                 slot_resolved_edge_counts.append(metric_summary["resolved_edge_count"])
-                if uses_rollout_buffer:
+                if uses_graph_gat_mappo:
+                    next_graph_build_start = time.perf_counter()
+                    next_graph_state = build_topology_graph_state(
+                        torch.as_tensor(next_joint_state, dtype=torch.float32),
+                        num_devices=len(devices),
+                        num_servers=len(servers),
+                    )
+                    episode_graph_build_time += (
+                        time.perf_counter() - next_graph_build_start
+                    )
+                    graph_rollout_buffer.push(
+                        graph_state=graph_state,
+                        actions=joint_actions,
+                        rewards=joint_rewards,
+                        next_graph_state=next_graph_state,
+                        old_log_probs=old_log_probs,
+                        done=step_episode_done,
+                    )
+                    episode_graph_transition_count += 1.0
+                elif uses_rollout_buffer:
                     old_log_probs = [
                         float(getattr(agent, "last_action_log_prob", 0.0))
                         for agent in agents
@@ -630,6 +802,15 @@ def train_algorithm(
         history["resolved_local_count"].append(episode_resolved_local_count)
         history["resolved_edge_count"].append(episode_resolved_edge_count)
 
+        if uses_graph_gat_mappo:
+            episode_graph_update_time = _update_graph_gat_mappo_from_rollout(
+                agents[0], graph_rollout_buffer, gamma
+            )
+        history["graph_build_time"].append(episode_graph_build_time)
+        history["graph_action_time"].append(episode_graph_action_time)
+        history["graph_update_time"].append(episode_graph_update_time)
+        history["graph_transition_count"].append(episode_graph_transition_count)
+
         episode_iterator.set_postfix(
             reward=f"{episode_avg_reward:.3f}",
             delay=f"{episode_avg_delay:.3f}s",
@@ -645,7 +826,7 @@ def train_algorithm(
         # 4. Network Updates
         if uses_rollout_buffer:
             _update_agents_from_rollout(agents, rollout_buffer, gamma)
-        else:
+        elif not uses_graph_gat_mappo:
             _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
     
         if episode_number % 500 == 0 or episode_number == 1:
@@ -669,6 +850,14 @@ def train_algorithm(
                 f"| Penalty: {history['penalty_count'][-1]:.0f} / "
                 f"{history['penalty_time'][-1]:.3f}s"
             )
+            if uses_graph_gat_mappo:
+                print(
+                    f"[{algo_name}] Graph-GAT Cost | Build: "
+                    f"{history['graph_build_time'][-1]:.3f}s "
+                    f"| Action: {history['graph_action_time'][-1]:.3f}s "
+                    f"| Update: {history['graph_update_time'][-1]:.3f}s "
+                    f"| Transitions: {history['graph_transition_count'][-1]:.0f}"
+                )
             
     return history
 
@@ -689,14 +878,18 @@ if __name__ == "__main__":
 
     gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=int(confirmed["gcn_hidden_dim"]))
     gcn_ckpt_path = "models/checkpoints/gcn_priority.pt"
-    sample_training_dag = make_gcn_dag_sampler(data_loader)
+    sample_training_dag = make_gcn_dag_sampler(
+        data_loader,
+        t_max=provisional["t_max"],
+        e_max=provisional["e_max"],
+    )
 
     gcn_model = load_or_train_gcn(
         gcn_model=gcn_model,
         dag_sampler=sample_training_dag,
         checkpoint_path=gcn_ckpt_path,
-        epochs=200,
-        samples_per_epoch=32,
+        epochs=int(provisional["gcn_pretrain_epochs"]),
+        samples_per_epoch=int(provisional["gcn_samples_per_epoch"]),
         lr=confirmed["gcn_lr"],
     )
     
@@ -706,7 +899,11 @@ if __name__ == "__main__":
         EdgeServer(
             j + 1,
             loc,
-            np.random.uniform(5.3, 5.5) * 1e9,
+            np.random.uniform(
+                provisional["server_compute_power_min_ghz"],
+                provisional["server_compute_power_max_ghz"],
+            )
+            * 1e9,
             confirmed["server_tx_power_w"],
             confirmed["server_energy_coeff"],
             coverage_radius=confirmed["coverage_radius_m"],
@@ -726,7 +923,11 @@ if __name__ == "__main__":
         IndustrialDevice(
             i + 1,
             robot_starts[i],
-            np.random.uniform(0.8, 1.2) * 1e9,
+            np.random.uniform(
+                provisional["device_compute_power_min_ghz"],
+                provisional["device_compute_power_max_ghz"],
+            )
+            * 1e9,
             confirmed["device_tx_power_w"],
             confirmed["device_energy_coeff"],
             speed_mps=confirmed["device_speed_mps"],
@@ -740,8 +941,8 @@ if __name__ == "__main__":
     # 3. Run Comparisons
     results = {"reward": {}, "delay": {}, "energy": {}}
     priority_results = {"reward": {}, "delay": {}, "energy": {}}
-    FULL_EPISODES = 300
-    BASELINE_EVALUATION_EPISODES = 5
+    FULL_EPISODES = int(provisional["comparison_full_episodes"])
+    BASELINE_EVALUATION_EPISODES = int(provisional["baseline_evaluation_episodes"])
     algorithm_episode_counts = {}
     last_training_state_rows = []
 

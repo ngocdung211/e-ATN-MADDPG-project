@@ -67,8 +67,8 @@ def test_topology_gat_encoder_returns_device_embeddings() -> None:
         _make_joint_state(), num_devices=2, num_servers=2
     )
     encoder = TopologyGATEncoder(
-        node_feature_dim=9,
-        edge_feature_dim=5,
+        node_feature_dim=14,
+        edge_feature_dim=7,
         hidden_dim=16,
         embedding_dim=8,
     )
@@ -90,8 +90,8 @@ def test_topology_gat_encoder_backpropagates_gradients() -> None:
         _make_joint_state(), num_devices=2, num_servers=2
     )
     encoder = TopologyGATEncoder(
-        node_feature_dim=9,
-        edge_feature_dim=5,
+        node_feature_dim=14,
+        edge_feature_dim=7,
         hidden_dim=16,
         embedding_dim=8,
     )

@@ -505,8 +505,7 @@ class DITENEnv:
             task_dag = item["task_dag"]
             current_subtask_id = item["subtask_id"]
 
-            # instant_delay = max(0.0, item["finish_time"] - self.current_slot)
-            instant_delay = item["transfer_time"] + item["queue_or_wait_time"] + (
+            subtask_latency = item["transfer_time"] + item["queue_or_wait_time"] + (
                 item["finish_time"] - item["start_time"]
             )
             instant_energy = item["tx_energy"] + item["e_comp"]
@@ -516,6 +515,9 @@ class DITENEnv:
 
             accum_delay = self.slot_accumulated_delay[device.id]
             accum_energy = self.slot_accumulated_energy[device.id]
+            finish_elapsed = max(0.0, item["finish_time"] - self.current_slot)
+            dag_makespan = max(accum_delay, finish_elapsed)
+            instant_delay = dag_makespan - accum_delay
             self.slot_accumulated_delay[device.id] += instant_delay
             self.slot_accumulated_energy[device.id] += instant_energy
             self.device_accumulated_delay[device.id] += instant_delay
@@ -543,6 +545,8 @@ class DITENEnv:
                     "queue_or_wait_time": float(item["queue_or_wait_time"]),
                     "transfer_time": float(item["transfer_time"]),
                     "delay": float(instant_delay),
+                    "subtask_latency": float(subtask_latency),
+                    "dag_makespan": float(dag_makespan),
                     "energy": float(instant_energy),
                     "tx_energy": float(item["tx_energy"]),
                     "comp_energy": float(item["e_comp"]),

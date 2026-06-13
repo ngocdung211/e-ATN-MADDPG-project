@@ -133,6 +133,7 @@ class MAPPOAgent:
         gamma: float = 0.99,
         clip_param: float = 0.2,
         ppo_epochs: int = 4,
+        use_action_mask: bool = False,
     ):
         """Initialize the MAPPO agent.
 
@@ -144,11 +145,13 @@ class MAPPOAgent:
             gamma: Discount factor.
             clip_param: PPO clipping parameter.
             ppo_epochs: PPO epochs per update.
+            use_action_mask: Whether to mask disconnected edge-server actions.
         """
         self.action_dim = action_dim
         self.gamma = gamma
         self.clip_param = clip_param
         self.ppo_epochs = ppo_epochs
+        self.use_action_mask = use_action_mask
         
         self.actor = StochasticActor(state_dim, action_dim)
         self.critic = CentralizedValueCritic(state_dim, num_agents)
@@ -181,10 +184,49 @@ class MAPPOAgent:
         """
         with torch.no_grad():
             probs = self.actor(state)
+            probs = self._masked_action_probabilities(probs, state)
             distribution = Categorical(probs)
             action = distribution.sample()
             log_prob = distribution.log_prob(action)
             return action.item(), float(log_prob.item())
+
+    def _action_mask_from_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Return valid local/server actions from flat connection windows."""
+        mask = torch.zeros(
+            self.action_dim,
+            dtype=torch.bool,
+            device=state.device,
+        )
+        mask[0] = True
+        num_servers = self.action_dim - 1
+        if num_servers <= 0:
+            return mask
+
+        window_values = state[-2 * num_servers:]
+        window_starts = window_values[:num_servers]
+        window_ends = window_values[num_servers:]
+        mask[1:] = window_ends > window_starts
+        return mask
+
+    def _masked_action_probabilities(
+        self, probabilities: torch.Tensor, state: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply optional action mask and renormalize probabilities."""
+        if not self.use_action_mask:
+            return probabilities
+
+        if probabilities.dim() == 1:
+            mask = self._action_mask_from_state(state).float()
+            masked_probabilities = probabilities * mask
+            return masked_probabilities / masked_probabilities.sum().clamp_min(1e-8)
+
+        masks = torch.stack(
+            [self._action_mask_from_state(row_state) for row_state in state],
+            dim=0,
+        ).float()
+        masked_probabilities = probabilities * masks
+        probability_sum = masked_probabilities.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return masked_probabilities / probability_sum
 
     def update_agent(
         self,
@@ -238,6 +280,7 @@ class MAPPOAgent:
         # 2. PPO Epochs
         for _ in range(self.ppo_epochs):
             probs = self.actor(agent_states)
+            probs = self._masked_action_probabilities(probs, agent_states)
             distribution = Categorical(probs)
             log_probs = distribution.log_prob(agent_actions)
             entropy = distribution.entropy().mean()

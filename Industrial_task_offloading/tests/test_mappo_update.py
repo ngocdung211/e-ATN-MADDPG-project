@@ -94,6 +94,39 @@ def test_select_action_with_log_prob_returns_rollout_metadata() -> None:
     assert isinstance(log_prob, float)
 
 
+def test_mappo_action_mask_zeros_disconnected_server_probabilities() -> None:
+    """MAPPO mask should keep local and remove disconnected server actions."""
+    agent = MAPPOAgent(
+        state_dim=9,
+        action_dim=3,
+        num_agents=1,
+        use_action_mask=True,
+    )
+    state = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4, 1.0, 0.4])
+    probabilities = torch.tensor([0.2, 0.3, 0.5])
+
+    masked = agent._masked_action_probabilities(probabilities, state)
+
+    assert masked[2].item() == 0.0
+    assert torch.allclose(masked.sum(), torch.tensor(1.0))
+
+
+def test_mappo_action_mask_can_be_disabled() -> None:
+    """MAPPO mask toggle should preserve raw probabilities when disabled."""
+    agent = MAPPOAgent(
+        state_dim=9,
+        action_dim=3,
+        num_agents=1,
+        use_action_mask=False,
+    )
+    state = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4, 1.0, 0.4])
+    probabilities = torch.tensor([0.2, 0.3, 0.5])
+
+    masked = agent._masked_action_probabilities(probabilities, state)
+
+    assert torch.allclose(masked, probabilities)
+
+
 def test_centralized_value_critic_returns_one_value_per_sample() -> None:
     """MAPPO critic should evaluate flattened joint states."""
     agent = MAPPOAgent(state_dim=4, action_dim=3, num_agents=2)

@@ -23,6 +23,20 @@ def _build_task_dag() -> TaskDAG:
     return task_dag
 
 
+def _build_diamond_task_dag() -> TaskDAG:
+    """Build a diamond DAG where branch subtasks can overlap."""
+    task_dag = TaskDAG(task_id=1, t_max=1.0, e_max=1.0)
+    task_dag.add_subtask(Subtask(1, cpu_cycles=1e8, data_size=0.0, result_size=0.0))
+    task_dag.add_subtask(Subtask(2, cpu_cycles=8e8, data_size=0.0, result_size=0.0))
+    task_dag.add_subtask(Subtask(3, cpu_cycles=1e6, data_size=0.0, result_size=0.0))
+    task_dag.add_subtask(Subtask(4, cpu_cycles=1e6, data_size=0.0, result_size=0.0))
+    task_dag.add_dependency(1, 2)
+    task_dag.add_dependency(1, 3)
+    task_dag.add_dependency(2, 4)
+    task_dag.add_dependency(3, 4)
+    return task_dag
+
+
 def _build_env(server_location: np.ndarray) -> DITENEnv:
     """Build a one-device, one-server environment."""
     device = IndustrialDevice(
@@ -123,3 +137,21 @@ def test_invalid_priority_order_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="predecessor"):
         env.start_time_slot({1: task_dag}, {1: [2, 1]})
+
+
+def test_parallel_branch_delay_uses_dag_makespan() -> None:
+    """A faster parallel branch should not add to accumulated DAG delay."""
+    env = _build_env(server_location=np.array([10.0, 10.0]))
+    task_dag = _build_diamond_task_dag()
+    env.reset({1: task_dag}, {1: [1, 2, 3, 4]})
+
+    env.step([0])
+    env.step([0])
+    delay_after_local_branch = env.device_accumulated_delay[1]
+
+    env.step([1])
+
+    edge_branch_finish_elapsed = env.last_step_metrics[0]["finish_time"] - env.current_slot
+    expected_makespan = max(delay_after_local_branch, edge_branch_finish_elapsed)
+    assert edge_branch_finish_elapsed < delay_after_local_branch
+    assert env.device_accumulated_delay[1] == pytest.approx(expected_makespan)

@@ -25,9 +25,13 @@ What is now implemented:
 - [x] Action diagnostics for requested local/edge counts and actual resolved local/edge counts.
 - [x] Readable comparison output for short runs, printed only on the final episode.
 - [x] Environment logic was manually adjusted by the user and is reported as good enough for the model to run.
-- [x] Environment freeze decision: do not change `environment/diten_env.py`, `environment/network_env.py`, or `dataset/data_loader.py` during the first model sanity phase.
+- [x] Environment freeze decision completed for first model sanity phase.
+- [x] Paper-style delay fix: `environment/diten_env.py` now accumulates DAG makespan delay instead of summing overlapping branch subtask latencies.
 - [x] Efficient 100-episode comparison plotting: train learning models for 100 episodes, run fixed baselines for a short evaluation, and plot fixed baselines as mean-flat reference lines.
 - [x] Last training state JSONL: save one flat line per model beside the generated plot images for easy comparison.
+- [x] Experiment parameters are centralized in `ultils/paper_config.py` for the active comparison runner, including reward weights, penalties, estimation errors, GCN pretraining size, compute-power ranges, episode budgets, MAPPO settings, and Graph-GAT settings.
+- [x] `t_max` and `e_max` from `PAPER_PARAMS` are passed into GCN DAG sampling and per-episode task DAG generation in `run_comparision.py`.
+- [x] MAPPO and Graph-GAT MAPPO action masks can be turned on/off from `ultils/paper_config.py`.
 
 Current output should now look like:
 
@@ -186,7 +190,7 @@ Stop after each small task and wait for user verification.
      - [x] node feature tensor shape is `(num_devices + num_servers, node_feature_dim)`.
      - [x] edge index shape is `(2, num_edges)`.
      - [x] edge feature tensor length matches `num_edges`.
-     - [x] disconnected server windows do not create valid offload edges.
+     - [x] disconnected server windows are represented with explicit edge flags.
 
 3. [x] **Implement minimal topology graph builder**
    - Goal: Convert existing flat joint state into graph tensors without touching env internals.
@@ -218,43 +222,50 @@ Stop after each small task and wait for user verification.
      - [x] unit tests pass with `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_topology_gat.py -q -p no:cacheprovider`.
      - [x] no training script changes yet.
 
-6. [ ] **Create Graph-GAT MAPPO ablation agent tests** (next)
+6. [x] **Create Graph-GAT MAPPO ablation agent tests**
    - Goal: Define the first graph-state DRL integration around MAPPO before implementation.
    - Candidate files:
      - `tests/test_graph_gat_mappo.py`
      - `baselines/graph_gat_mappo.py`
    - Verify:
-     - action dimension remains `0=local, 1..S=edge server`.
-     - actor samples valid actions from graph-derived device embeddings.
-     - rollout buffer can store graph states, next graph states, actions, rewards, old log-probs, and done flags.
-     - GAT parameters change after one PPO rollout update.
-     - flat-state `MAPPOAgent` tests still pass unchanged.
+     - [x] action dimension remains `0=local, 1..S=edge server`.
+     - [x] actor samples valid actions from graph-derived device embeddings.
+     - [x] rollout buffer can store graph states, next graph states, actions, rewards, old log-probs, and done flags.
+     - [x] GAT parameters change after one PPO rollout update.
+     - [x] flat-state `MAPPOAgent` tests still pass unchanged.
 
-7. [ ] **Implement Graph-GAT MAPPO agent**
+7. [x] **Implement Graph-GAT MAPPO agent**
    - Goal: Add a separate MAPPO variant that consumes graph states through a GAT encoder.
    - Candidate name:
      - `GraphGATMAPPOAgent`
    - Candidate file:
      - `baselines/graph_gat_mappo.py`
    - Verify:
-     - uses `TopologyGATEncoder` to create one embedding per device.
-     - MAPPO actor uses each device embedding to sample an action.
-     - centralized critic uses graph/device embeddings or a graph-level pooled representation.
-     - PPO update backpropagates through MAPPO and GAT.
-     - no changes are required in `baselines/mappo.py` for flat MAPPO behavior.
+     - [x] uses `TopologyGATEncoder` to create one embedding per device.
+     - [x] MAPPO actor uses each device embedding to sample an action.
+     - [x] centralized critic uses graph/device embeddings.
+     - [x] PPO update backpropagates through MAPPO and GAT.
+     - [x] no changes are required in `baselines/mappo.py` for flat MAPPO behavior.
+     - [x] related tests pass with `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_topology_graph_state.py tests/test_topology_gat.py tests/test_graph_gat_mappo.py tests/test_mappo_update.py -q -p no:cacheprovider`.
 
-8. [ ] **Wire Graph-GAT MAPPO into comparison config behind a separate name**
+8. [x] **Wire Graph-GAT MAPPO into comparison config behind a separate name**
    - Goal: Add the model as an optional comparison line, not as a replacement for flat MAPPO.
    - Candidate display name:
      - `Graph-GAT MAPPO`
    - Candidate file:
      - `run_comparision.py`
    - Verify:
-     - original flat-state `MAPPO` still runs.
-     - `Graph-GAT MAPPO` can run 1-3 smoke episodes.
-     - JSONL saves a separate one-line final state for the ablation model.
+     - [x] original flat-state `MAPPO` tests still pass.
+     - [x] `Graph-GAT MAPPO` is registered as a separate comparison model.
+     - [x] comparison loop can collect graph-state actions and update graph rollout.
+     - [x] Graph-GAT timing diagnostics report graph build, action selection, update time, and transition count.
+     - [x] Graph-GAT PPO update reuses each epoch embedding for both actor log-probabilities and critic value.
+     - [x] Graph state includes task priority vector in device nodes and explicit connected/disconnected edge flags.
+     - [x] Graph-GAT MAPPO masks disconnected server actions during sampling and PPO log-prob recomputation.
+     - [ ] `Graph-GAT MAPPO` can run 1-3 smoke episodes.
+     - [ ] JSONL saves a separate one-line final state for the ablation model.
 
-9. [ ] **Run Graph-GAT MAPPO smoke test**
+9. [ ] **Run Graph-GAT MAPPO smoke test** (next)
    - Goal: Check integration before long training.
    - Run:
      - 1-3 episodes for `Graph-GAT MAPPO`.
@@ -263,6 +274,8 @@ Stop after each small task and wait for user verification.
      - reward/delay/energy finite.
      - graph rollout buffer fills.
      - PPO actor/critic/GAT update path runs.
+     - Graph-GAT cost line shows whether graph build, action, or update is the bottleneck.
+     - requested edge actions should no longer target disconnected servers.
 
 10. [ ] **Run short MAPPO ablation comparison**
    - Goal: Compare trend, not final paper-quality numbers.

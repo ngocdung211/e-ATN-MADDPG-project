@@ -76,7 +76,7 @@ class KolektorSDDLoader:
             "subtask_2": {  # Image Denoising
                 "data_size": raw_bits,
                 "result_size": raw_bits,
-                "cpu_cycles": pixels * 100,
+                "cpu_cycles": pixels * 200,
             },
             "subtask_3": {  # Standardization
                 "data_size": raw_bits,
@@ -91,7 +91,7 @@ class KolektorSDDLoader:
             "subtask_5": {  # Detection and Recognition
                 "data_size": file_size_bits * 0.03,
                 "result_size": 256,
-                "cpu_cycles": pixels * 150,
+                "cpu_cycles": pixels * 300,
             },
         }
         

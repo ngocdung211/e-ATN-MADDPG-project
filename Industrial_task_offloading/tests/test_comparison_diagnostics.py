@@ -15,7 +15,9 @@ from run_comparision import (
     _last_training_state_line,
     _should_print_diagnostics,
     _summarize_step_metrics,
+    build_algorithm_configs,
 )
+from ultils.paper_config import PAPER_PARAMS
 
 
 def test_summarize_step_metrics_counts_penalties_and_times() -> None:
@@ -101,6 +103,33 @@ def test_fixed_baselines_use_short_episode_budget() -> None:
     assert _episodes_for_algorithm("Random Offloading", full_episodes=100, baseline_episodes=10) == 10
     assert _episodes_for_algorithm("e-ATN-MADDPG", full_episodes=100, baseline_episodes=10) == 100
     assert _episodes_for_algorithm("MAPPO", full_episodes=100, baseline_episodes=10) == 100
+
+
+def test_learning_algorithm_kwargs_use_config_values() -> None:
+    """Comparison model kwargs should come from centralized paper config."""
+    provisional = PAPER_PARAMS["provisional_table2_needed"]
+    configs = build_algorithm_configs()
+
+    assert configs["MAPPO"]["kwargs"]["gamma"] == provisional["gamma"]
+    assert configs["MAPPO"]["kwargs"]["clip_param"] == provisional["mappo_clip_param"]
+    assert configs["MAPPO"]["kwargs"]["ppo_epochs"] == int(
+        provisional["mappo_ppo_epochs"]
+    )
+    assert (
+        configs["MAPPO"]["kwargs"]["use_action_mask"]
+        == provisional["mappo_use_action_mask"]
+    )
+    assert configs["Graph-GAT MAPPO"]["kwargs"]["gamma"] == provisional["gamma"]
+    assert configs["Graph-GAT MAPPO"]["kwargs"]["hidden_dim"] == int(
+        provisional["graph_gat_hidden_dim"]
+    )
+    assert configs["Graph-GAT MAPPO"]["kwargs"]["embedding_dim"] == int(
+        provisional["graph_gat_embedding_dim"]
+    )
+    assert (
+        configs["Graph-GAT MAPPO"]["kwargs"]["use_action_mask"]
+        == provisional["graph_gat_use_action_mask"]
+    )
 
 
 def test_fixed_baseline_plot_results_are_mean_flat_lines() -> None:
