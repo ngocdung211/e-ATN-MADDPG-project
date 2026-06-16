@@ -29,11 +29,16 @@ from environment.system_model import EdgeServer, IndustrialDevice, TaskDAG
 from environment.diten_env import DITENEnv
 from dataset.data_loader import KolektorSDDLoader
 from models.replay_buffer import MultiAgentReplayBuffer
-from models.gcn import TaskPriorityGCN
 from models.maddpg import EpsilonATNMADDPGAgent
 from ultils.plotter2 import DITENPlotter2
-from ultils.gcn_training import load_or_train_gcn
-from ultils.experiment_setup import build_priorities, generate_task_dags_for_episode, make_gcn_dag_sampler
+from ultils.gcn_training import load_or_train_priority_model
+from ultils.experiment_setup import (
+    build_priorities,
+    build_task_priority_model,
+    generate_task_dags_for_episode,
+    get_priority_checkpoint_path,
+    make_gcn_dag_sampler,
+)
 from ultils.paper_config import PAPER_PARAMS
 from ultils.topology_graph_state import TopologyGraphState, build_topology_graph_state
 import time
@@ -73,51 +78,75 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
         "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
         # "Feature Extraction Edge": {"class": FeatureExtractionEdgeAgent, "kwargs": {}},
         # "Random Offloading": {"class": RandomOffloadingAgent, "kwargs": {}},
-        "e-ATN-MADDPG": {
+        # "e-ATN-MADDPG": {
+        #     "class": EpsilonATNMADDPGAgent,
+        #     "kwargs": {
+        #         "use_attention": True,
+        #         "use_epsilon_greedy": True,
+        #         "lr": confirmed["rl_lr"],
+        #         "epsilon_init": provisional["epsilon_init"],
+        #         "epsilon_min": provisional["epsilon_min"],
+        #         "decay": provisional["epsilon_decay"],
+        #     },
+        "MADDPG": {
             "class": EpsilonATNMADDPGAgent,
             "kwargs": {
-                "use_attention": True,
-                "use_epsilon_greedy": True,
+                "use_attention": False,
+                "use_epsilon_greedy": False,
                 "lr": confirmed["rl_lr"],
                 "epsilon_init": provisional["epsilon_init"],
                 "epsilon_min": provisional["epsilon_min"],
                 "decay": provisional["epsilon_decay"],
             },
         },
-        # "MADDPG": {
-        #     "class": EpsilonATNMADDPGAgent,
-        #     "kwargs": {
-        #         "use_attention": False,
-        #         "use_epsilon_greedy": False,
-        #         "lr": confirmed["rl_lr"],
-        #         "epsilon_init": provisional["epsilon_init"],
-        #         "epsilon_min": provisional["epsilon_min"],
-        #         "decay": provisional["epsilon_decay"],
-        #     },
-        # },
-        # "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
-        # "MAPPO": {
-        #     "class": MAPPOAgent,
-        #     "kwargs": {
-        #         "lr": confirmed["rl_lr"],
-        #         "gamma": provisional["gamma"],
-        #         "clip_param": provisional["mappo_clip_param"],
-        #         "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
-        #         "use_action_mask": provisional["mappo_use_action_mask"],
-        #     },
-        # },
-        # "Graph-GAT MAPPO": {
-        #     "class": GraphGATMAPPOAgent,
-        #     "kwargs": {
-        #         "lr": confirmed["rl_lr"],
-        #         "gamma": provisional["gamma"],
-        #         "hidden_dim": int(provisional["graph_gat_hidden_dim"]),
-        #         "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
-        #         "clip_param": provisional["graph_gat_clip_param"],
-        #         "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
-        #         "use_action_mask": provisional["graph_gat_use_action_mask"],
-        #     },
-        # },
+        "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        "MAPPO": {
+            "class": MAPPOAgent,
+            "kwargs": {
+                "lr": confirmed["rl_lr"],
+                "gamma": provisional["gamma"],
+                "clip_param": provisional["mappo_clip_param"],
+                "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
+                "use_action_mask": False,
+            },
+        },
+        "Mask-MAPPO": {
+            "class": MAPPOAgent,
+            "kwargs": {
+                "lr": confirmed["rl_lr"],
+                "gamma": provisional["gamma"],
+                "clip_param": provisional["mappo_clip_param"],
+                "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
+                "use_action_mask": provisional["mappo_use_action_mask"],
+            },
+        },
+
+        "GAT-MAPPO": {
+            "class": GraphGATMAPPOAgent,
+            "kwargs": {
+                "lr": confirmed["rl_lr"],
+                "gamma": provisional["gamma"],
+                "hidden_dim": int(provisional["graph_gat_hidden_dim"]),
+                "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
+                "clip_param": provisional["graph_gat_clip_param"],
+                "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+                "use_action_mask": False,
+                # "device": provisional["graph_gat_device"],
+            },
+        },
+        "GAT-Mask MAPPO": {
+            "class": GraphGATMAPPOAgent,
+            "kwargs": {
+                "lr": confirmed["rl_lr"],
+                "gamma": provisional["gamma"],
+                "hidden_dim": int(provisional["graph_gat_hidden_dim"]),
+                "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
+                "clip_param": provisional["graph_gat_clip_param"],
+                "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+                "use_action_mask": provisional["graph_gat_use_action_mask"],
+                # "device": provisional["graph_gat_device"],
+            },
+        },
 
     }
 
@@ -286,15 +315,15 @@ def _save_model_checkpoint(save_dir: str, checkpoint: Dict[str, Any]) -> str:
 
 def build_priorities_by_mode(
     task_dags: Dict[int, TaskDAG],
-    gcn_model: TaskPriorityGCN,
+    priority_model: torch.nn.Module,
     mode: str = "gcn",
 ) -> Dict[int, List[int]]:
     """Build per-device subtask priorities based on the selected mode.
 
     Args:
         task_dags: Mapping of device IDs to TaskDAGs.
-        gcn_model: TaskPriorityGCN used to infer priorities.
-        mode: Scheduling mode ("gcn", "random", "greedy").
+        priority_model: GCN/GAT priority model used to infer priorities.
+        mode: Scheduling mode ("gcn", "gat", "random", "greedy").
 
     Returns:
         Mapping of device IDs to ordered subtask IDs.
@@ -305,8 +334,14 @@ def build_priorities_by_mode(
             priorities[device_id] = BaselineSchedulers.random_scheduling(task_dag)
         elif mode == "greedy":
             priorities[device_id] = BaselineSchedulers.greedy_scheduling(task_dag)
+        elif mode in {"gcn", "gat"}:
+            priorities[device_id] = build_priorities(
+                {device_id: task_dag}, priority_model
+            )[device_id]
         else:
-            priorities[device_id] = build_priorities({device_id: task_dag}, gcn_model)[device_id]
+            raise ValueError(
+                "priority mode must be one of: gcn, gat, random, greedy"
+            )
     return priorities
 
 
@@ -592,7 +627,7 @@ def train_algorithm(
     servers: Sequence[EdgeServer],
     network_env: NetworkEnvironment,
     data_loader: KolektorSDDLoader,
-    gcn_model: TaskPriorityGCN,
+    priority_model: torch.nn.Module,
     num_episodes: int,
     priority_mode: str = "gcn",
 ) -> Tuple[Dict[str, List[float]], Optional[Dict[str, Any]]]:
@@ -605,15 +640,15 @@ def train_algorithm(
         servers: List of EdgeServer instances.
         network_env: NetworkEnvironment instance.
         data_loader: Dataset loader for DAG generation.
-        gcn_model: TaskPriorityGCN used for priority extraction.
+        priority_model: GCN/GAT model used for priority extraction.
         num_episodes: Number of episodes to train.
-        priority_mode: Scheduling mode ("gcn", "random", "greedy").
+        priority_mode: Scheduling mode ("gcn", "gat", "random", "greedy").
 
     Returns:
         Tuple of metric history and optional trainable model checkpoint payload.
     """
     print(f"\n{'='*50}\nStarting Training for: {algo_name}\n{'='*50}")
-    set_seed(42)  # Reset seed for fair comparison
+    set_seed(64)  # Reset seed for fair comparison
     confirmed = PAPER_PARAMS["confirmed"]
     provisional = PAPER_PARAMS["provisional_table2_needed"]
 
@@ -740,7 +775,7 @@ def train_algorithm(
                 t_max=provisional["t_max"],
                 e_max=provisional["e_max"],
             )
-            priorities = build_priorities_by_mode(task_dags, gcn_model, priority_mode)
+            priorities = build_priorities_by_mode(task_dags, priority_model, priority_mode)
 
             current_joint_state = env.start_time_slot(task_dags, priorities)
             slot_done = False
@@ -976,21 +1011,27 @@ if __name__ == "__main__":
         f"(paper: 399; aligned={dataset_stats['is_paper_count_aligned']})"
     )
 
-    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=int(confirmed["gcn_hidden_dim"]))
-    gcn_ckpt_path = "models/checkpoints/gcn_priority.pt"
+    priority_model_name = str(provisional["priority_model"]).lower()
+    priority_model = build_task_priority_model(
+        priority_model_name,
+        num_features=3,
+        hidden_dim=int(confirmed["gcn_hidden_dim"]),
+    )
+    priority_ckpt_path = get_priority_checkpoint_path(priority_model_name)
     sample_training_dag = make_gcn_dag_sampler(
         data_loader,
         t_max=provisional["t_max"],
         e_max=provisional["e_max"],
     )
 
-    gcn_model = load_or_train_gcn(
-        gcn_model=gcn_model,
+    priority_model = load_or_train_priority_model(
+        priority_model=priority_model,
         dag_sampler=sample_training_dag,
-        checkpoint_path=gcn_ckpt_path,
+        checkpoint_path=priority_ckpt_path,
         epochs=int(provisional["gcn_pretrain_epochs"]),
         samples_per_epoch=int(provisional["gcn_samples_per_epoch"]),
         lr=confirmed["gcn_lr"],
+        model_label=priority_model_name.upper(),
     )
     
     # Fixed Edge Servers (User-confirmed Fig.4 topology)
@@ -1048,7 +1089,7 @@ if __name__ == "__main__":
     model_checkpoints = []
 
     # Fig.6-style priority extraction comparison under fixed e-ATN-MADDPG.
-    priority_modes = {"Random Scheduling": "random", "Greedy Scheduling": "greedy", "GCN Scheduling": "gcn"}
+    priority_modes = {"Random Scheduling": "random", "Greedy Scheduling": "greedy", "GCN Scheduling": "gcn", "GAT Scheduling": "gat"}
     # priority_modes = {"GCN Scheduling": "gcn"}
     # e_atn_cfg = {
     #     "class": EpsilonATNMADDPGAgent,
@@ -1069,7 +1110,7 @@ if __name__ == "__main__":
     #         servers,
     #         network_env,
     #         data_loader,
-    #         gcn_model=gcn_model,
+    #         priority_model=priority_model,
     #         num_episodes=FULL_EPISODES,
     #         priority_mode=mode,
     #     )
@@ -1092,8 +1133,8 @@ if __name__ == "__main__":
             network_env,
             data_loader,
             num_episodes=run_episodes,
-            gcn_model=gcn_model,
-            priority_mode="gcn",
+            priority_model=priority_model,
+            priority_mode=priority_model_name,
         )
         results["reward"][algo_name] = history["reward"]
         results["delay"][algo_name] = history["delay"]

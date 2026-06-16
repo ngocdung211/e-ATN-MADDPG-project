@@ -33,6 +33,8 @@ What is now implemented:
 - [x] `t_max` and `e_max` from `PAPER_PARAMS` are passed into GCN DAG sampling and per-episode task DAG generation in `run_comparision.py`.
 - [x] MAPPO and Graph-GAT MAPPO action masks can be turned on/off from `ultils/paper_config.py`.
 - [x] Trainable model checkpoints are saved into the same plot folder as images and last-state JSONL for later evaluation without retraining.
+- [x] GPU readiness stage added without changing training logic: `ultils/gpu_readiness.py` reports PyTorch/CUDA/GPU status, and `docs/windows_gpu_readiness.md` documents the Windows RTX 4080 setup check.
+- [x] GAT task-priority extractor added as an option beside GCN: `models/task_priority_gat.py` implements `TaskPriorityGAT`, `priority_model` in `ultils/paper_config.py` selects `gcn` or `gat`, and GAT uses its own `models/checkpoints/gat_priority.pt`.
 
 Current output should now look like:
 
@@ -155,6 +157,48 @@ Stop after each task and wait for user verification.
    - Verify:
      - Do not tune reward weights until baseline and smoke model runs are understood.
      - Do not claim paper reproduction from short runs.
+
+9. [x] **Add GPU readiness check without training rewiring**
+   - Goal: Prepare for Windows RTX 4080 training while keeping the Mac demo stable.
+   - Files touched:
+     - `ultils/gpu_readiness.py`
+     - `docs/windows_gpu_readiness.md`
+     - `tests/test_gpu_readiness.py`
+   - Verify:
+     - readiness helper runs on CPU-only machines. `DONE`
+     - Windows guide says to verify CUDA before changing training code. `DONE`
+     - no agent, replay-buffer, environment, or comparison training logic is moved to GPU yet. `DONE`
+
+10. [ ] **Only move one training path to CUDA after Windows readiness passes**
+    - Goal: Avoid messy GPU bugs by proving the machine setup first.
+    - First target selected by user:
+      - `Graph-GAT MAPPO`
+    - Verify before/after code changes:
+      - `python -m ultils.gpu_readiness --preferred-device cuda` reports `CUDA available: True`.
+      - GPU name shows the server GPU.
+      - Mac CPU demo still remains the control path.
+    - Status:
+      - [x] `GraphGATMAPPOAgent` accepts a `device` setting and moves encoder/actor/critic modules to that torch device.
+      - [x] Graph-GAT rollout update tensors are created on the agent device.
+      - [x] Graph tensors remain built from CPU environment state, then move to the agent device at encode/mask boundaries.
+      - [x] `run_comparision.py` passes `graph_gat_device` from `ultils/paper_config.py` only to `Graph-GAT MAPPO`.
+      - [ ] Run 1-3 Graph-GAT MAPPO smoke episodes on the Windows GPU server.
+
+11. [x] **Add GAT as task-priority option beside GCN**
+    - Goal: Compare GCN priority extraction against a GAT priority extractor without removing the original GCN baseline.
+    - Files touched:
+      - `models/task_priority_gat.py`
+      - `ultils/experiment_setup.py`
+      - `ultils/gcn_training.py`
+      - `run_comparision.py`
+      - `main.py`
+      - `tests/test_task_priority_gat.py`
+    - Verify:
+      - GAT returns one priority score per subtask. `DONE`
+      - GAT can train against the current supervised priority targets. `DONE`
+      - `build_priorities` accepts a GAT model through the existing `(features, adjacency)` interface. `DONE`
+      - `priority_model = "gat"` uses a separate `gat_priority.pt` checkpoint. `DONE`
+      - GCN remains the default unless `priority_model` is changed. `DONE`
 
 ---
 

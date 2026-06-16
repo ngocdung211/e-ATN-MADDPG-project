@@ -26,7 +26,7 @@ class DITENPlotter2:
             "MADDPG":       {"color": "#2ca02c", "marker": "o"},  # Green, Circle
             "GR-MADDPG":    {"color": "#00ffff", "marker": "s"},  # Cyan, Square
             "ATN-MADDPG":   {"color": "#800080", "marker": "+"},  # Purple, Plus
-            "e-ATN-MADDPG": {"color": "#d62728", "marker": "*"}   # Red, Star (Proposed)
+            "GAT-Mask MAPPO": {"color": "#d62728", "marker": "*"}   # Red, Star (Proposed)
         }
 
     def plot_training_curve(

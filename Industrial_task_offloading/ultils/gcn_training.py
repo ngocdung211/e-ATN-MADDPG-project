@@ -119,37 +119,39 @@ def build_priority_targets(task_dag: TaskDAG) -> torch.Tensor:
     return torch.tensor(targets, dtype=torch.float32).unsqueeze(1)
 
 
-def load_or_train_gcn(
-    gcn_model: torch.nn.Module,
+def load_or_train_priority_model(
+    priority_model: torch.nn.Module,
     dag_sampler: Callable[[], TaskDAG],
     checkpoint_path: str,
     epochs: int = 200,
     samples_per_epoch: int = 32,
     lr: float = 1e-3,
+    model_label: str = "priority",
 ) -> torch.nn.Module:
-    """Load a pretrained GCN model or train one if missing.
+    """Load a pretrained priority model or train one if missing.
 
     Args:
-        gcn_model: GCN model instance.
+        priority_model: Priority model instance.
         dag_sampler: Callable that returns TaskDAG samples.
         checkpoint_path: Path to the model checkpoint.
         epochs: Number of training epochs.
         samples_per_epoch: DAG samples per epoch.
         lr: Learning rate.
+        model_label: Human-readable model label for logs.
 
     Returns:
-        Trained or loaded GCN model.
+        Trained or loaded priority model.
     """
     if os.path.exists(checkpoint_path):
         state_dict = torch.load(checkpoint_path, map_location="cpu")
-        gcn_model.load_state_dict(state_dict)
-        gcn_model.eval()
-        print(f"Loaded pretrained GCN weights from: {checkpoint_path}")
-        return gcn_model
+        priority_model.load_state_dict(state_dict)
+        priority_model.eval()
+        print(f"Loaded pretrained {model_label} weights from: {checkpoint_path}")
+        return priority_model
 
-    print("No pretrained GCN weights found. Training GCN priority model...")
-    optimizer = torch.optim.Adam(gcn_model.parameters(), lr=lr)
-    gcn_model.train()
+    print(f"No pretrained {model_label} weights found. Training priority model...")
+    optimizer = torch.optim.Adam(priority_model.parameters(), lr=lr)
+    priority_model.train()
 
     for epoch in range(epochs):
         epoch_loss = 0.0
@@ -159,7 +161,7 @@ def load_or_train_gcn(
 
             features, adjacency = extract_gcn_inputs(task_dag)
             y = build_priority_targets(task_dag)
-            pred = gcn_model(features, adjacency)
+            pred = priority_model(features, adjacency)
             loss = F.mse_loss(pred, y)
 
             optimizer.zero_grad()
@@ -169,10 +171,33 @@ def load_or_train_gcn(
 
         if (epoch + 1) % 50 == 0:
             avg_loss = epoch_loss / float(samples_per_epoch)
-            print(f"GCN pretrain epoch {epoch + 1}/{epochs} - loss: {avg_loss:.6f}")
+            print(
+                f"{model_label} pretrain epoch {epoch + 1}/{epochs} "
+                f"- loss: {avg_loss:.6f}"
+            )
 
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-    torch.save(gcn_model.state_dict(), checkpoint_path)
-    print(f"Saved GCN weights to: {checkpoint_path}")
-    gcn_model.eval()
-    return gcn_model
+    torch.save(priority_model.state_dict(), checkpoint_path)
+    print(f"Saved {model_label} weights to: {checkpoint_path}")
+    priority_model.eval()
+    return priority_model
+
+
+def load_or_train_gcn(
+    gcn_model: torch.nn.Module,
+    dag_sampler: Callable[[], TaskDAG],
+    checkpoint_path: str,
+    epochs: int = 200,
+    samples_per_epoch: int = 32,
+    lr: float = 1e-3,
+) -> torch.nn.Module:
+    """Load a pretrained GCN model or train one if missing."""
+    return load_or_train_priority_model(
+        priority_model=gcn_model,
+        dag_sampler=dag_sampler,
+        checkpoint_path=checkpoint_path,
+        epochs=epochs,
+        samples_per_epoch=samples_per_epoch,
+        lr=lr,
+        model_label="GCN",
+    )

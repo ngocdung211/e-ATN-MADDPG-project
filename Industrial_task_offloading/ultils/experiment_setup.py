@@ -8,10 +8,44 @@ import torch
 
 from dataset.data_loader import KolektorSDDLoader
 from environment.system_model import IndustrialDevice, Subtask, TaskDAG
+from models.gcn import TaskPriorityGCN
+from models.task_priority_gat import TaskPriorityGAT
 from ultils.graph_ultils import extract_gcn_inputs
 
 
 DEFAULT_DAG_EDGES = [(1, 2), (1, 3), (2, 4), (3, 4), (4, 5)]
+
+
+def build_task_priority_model(
+    model_name: str, num_features: int, hidden_dim: int
+) -> torch.nn.Module:
+    """Build a task-priority model by name.
+
+    Args:
+        model_name: Priority model name, either "gcn" or "gat".
+        num_features: Input node feature dimension.
+        hidden_dim: Hidden layer width.
+
+    Returns:
+        Task priority model.
+
+    Raises:
+        ValueError: If model_name is not supported.
+    """
+    normalized_name = model_name.lower()
+    if normalized_name == "gcn":
+        return TaskPriorityGCN(num_features=num_features, hidden_dim=hidden_dim)
+    if normalized_name == "gat":
+        return TaskPriorityGAT(num_features=num_features, hidden_dim=hidden_dim)
+    raise ValueError("priority model must be one of: gcn, gat")
+
+
+def get_priority_checkpoint_path(model_name: str) -> str:
+    """Return the checkpoint path for a priority model name."""
+    normalized_name = model_name.lower()
+    if normalized_name not in {"gcn", "gat"}:
+        raise ValueError("priority model must be one of: gcn, gat")
+    return f"models/checkpoints/{normalized_name}_priority.pt"
 
 
 def build_task_dag(

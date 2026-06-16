@@ -14,11 +14,16 @@ from environment.system_model import IndustrialDevice, EdgeServer
 from environment.diten_env import DITENEnv
 from models.replay_buffer import MultiAgentReplayBuffer
 from models.maddpg import EpsilonATNMADDPGAgent
-from models.gcn import TaskPriorityGCN
 from dataset.data_loader import KolektorSDDLoader
 from ultils.plotter import DITENPlotter
-from ultils.gcn_training import load_or_train_gcn
-from ultils.experiment_setup import build_priorities, generate_task_dags_for_episode, make_gcn_dag_sampler
+from ultils.gcn_training import load_or_train_priority_model
+from ultils.experiment_setup import (
+    build_priorities,
+    build_task_priority_model,
+    generate_task_dags_for_episode,
+    get_priority_checkpoint_path,
+    make_gcn_dag_sampler,
+)
 from ultils.paper_config import PAPER_PARAMS
 
 import random
@@ -115,7 +120,7 @@ def train_maddpg(
     devices: List[IndustrialDevice],
     env: DITENEnv,
     replay_buffer: MultiAgentReplayBuffer,
-    gcn_model: TaskPriorityGCN,
+    priority_model: torch.nn.Module,
     data_loader: KolektorSDDLoader,
     num_episodes: int = 2000,
     batch_size: int = 64,
@@ -129,7 +134,7 @@ def train_maddpg(
         devices: Industrial devices for the episode.
         env: DITEN environment instance.
         replay_buffer: Shared replay buffer for experience sampling.
-        gcn_model: TaskPriorityGCN for priority extraction.
+        priority_model: GCN/GAT model for priority extraction.
         data_loader: Dataset loader for task generation.
         num_episodes: Number of episodes to train.
         batch_size: Batch size for replay sampling.
@@ -158,7 +163,7 @@ def train_maddpg(
             prev_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
             prev_energy_mean = np.mean(list(env.device_accumulated_energy.values()))
             task_dags = generate_task_dags_for_episode(devices, data_loader)
-            priorities = build_priorities(task_dags, gcn_model)
+            priorities = build_priorities(task_dags, priority_model)
 
             current_joint_state = env.start_time_slot(task_dags, priorities)
             slot_done = False
@@ -296,20 +301,28 @@ if __name__ == "__main__":
     # Khởi tạo Data Loader
     data_loader = KolektorSDDLoader(dataset_path="dataset/KolektorSDD/")
 
-    # Khởi tạo GCN và Replay Buffer
-    gcn_model = TaskPriorityGCN(num_features=3, hidden_dim=int(confirmed["gcn_hidden_dim"]))
-    gcn_ckpt_path = "models/checkpoints/gcn_priority.pt"
+    # Khởi tạo priority model và Replay Buffer
+    priority_model_name = str(provisional["priority_model"]).lower()
+    priority_model = build_task_priority_model(
+        priority_model_name,
+        num_features=3,
+        hidden_dim=int(confirmed["gcn_hidden_dim"]),
+    )
+    priority_ckpt_path = get_priority_checkpoint_path(priority_model_name)
     sample_training_dag = make_gcn_dag_sampler(data_loader)
 
-    gcn_model = load_or_train_gcn(
-        gcn_model=gcn_model,
+    priority_model = load_or_train_priority_model(
+        priority_model=priority_model,
         dag_sampler=sample_training_dag,
-        checkpoint_path=gcn_ckpt_path,
+        checkpoint_path=priority_ckpt_path,
         epochs=200,
         samples_per_epoch=32,
         lr=confirmed["gcn_lr"],
+        model_label=priority_model_name.upper(),
     )
-    replay_buffer = MultiAgentReplayBuffer(capacity=int(provisional["replay_buffer_capacity"]))
+    replay_buffer = MultiAgentReplayBuffer(
+        capacity=int(provisional["replay_buffer_capacity"])
+    )
     
     # 6. Bắt đầu Huấn Luyện
     print("\nStarting Training (e-ATN-MADDPG)...")
@@ -320,7 +333,7 @@ if __name__ == "__main__":
         devices=devices,
         env=env, 
         replay_buffer=replay_buffer, 
-        gcn_model=gcn_model,
+        priority_model=priority_model,
         num_episodes=EPISODES,
         time_slots=TIME_SLOTS,
         data_loader=data_loader,
