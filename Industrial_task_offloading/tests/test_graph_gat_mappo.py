@@ -149,6 +149,50 @@ def test_graph_gat_mappo_action_mask_can_be_disabled() -> None:
     assert torch.allclose(masked_probabilities, probabilities)
 
 
+def test_graph_gat_topology_warmup_updates_encoder_parameters() -> None:
+    """Topology warmup should update GAT encoder before PPO action selection."""
+    torch.manual_seed(34)
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+        topology_warmup_lr=0.01,
+    )
+    graph_state = _make_graph_state()
+    encoder_before = _clone_module_parameters(agent.encoder)
+
+    loss_value = agent.warmup_topology_encoder(graph_state, update_count=2)
+
+    assert loss_value > 0.0
+    assert _parameters_changed(encoder_before, _clone_module_parameters(agent.encoder))
+
+
+def test_graph_gat_mappo_actor_uses_local_subgraph_embeddings() -> None:
+    """One device actor input should not depend on another device feature."""
+    torch.manual_seed(35)
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    base_state = _make_joint_state()
+    changed_state = base_state.clone()
+    changed_state[1, 0:10] = changed_state[1, 0:10] + 7.0
+
+    base_probabilities = agent._actor_probabilities_for_graph_state(
+        build_topology_graph_state(base_state, num_devices=2, num_servers=2)
+    )
+    changed_probabilities = agent._actor_probabilities_for_graph_state(
+        build_topology_graph_state(changed_state, num_devices=2, num_servers=2)
+    )
+
+    assert torch.allclose(base_probabilities[0], changed_probabilities[0], atol=1e-6)
+
+
 def test_graph_gat_rollout_buffer_keeps_graph_transitions() -> None:
     """Graph-GAT rollout buffer should keep graph states and PPO metadata."""
     buffer = GraphGATRolloutBuffer()
@@ -210,8 +254,19 @@ def test_graph_gat_mappo_is_registered_as_separate_comparison_model() -> None:
     configs = build_algorithm_configs()
 
     assert configs["Graph-GAT MAPPO"]["class"] is GraphGATMAPPOAgent
+    assert configs["Graph-GAT Mask MAPPO"]["class"] is GraphGATMAPPOAgent
+    assert configs["Graph-GAT Warmup Mask MAPPO"]["class"] is GraphGATMAPPOAgent
+    assert configs["Graph-GAT Warmup Mask MAPPO"]["kwargs"]["topology_warmup_episodes"] == 5
+    assert (
+        configs["Graph-GAT Warmup Mask MAPPO"]["kwargs"][
+            "topology_warmup_updates_per_step"
+        ]
+        == 10
+    )
     if "MAPPO" in configs:
         assert configs["MAPPO"]["class"] is not GraphGATMAPPOAgent
+    if "Mask-MAPPO" in configs:
+        assert configs["Mask-MAPPO"]["class"] is not GraphGATMAPPOAgent
 
 
 def test_collect_graph_gat_actions_builds_graph_from_joint_state() -> None:
@@ -283,8 +338,8 @@ def test_graph_gat_rollout_update_helper_updates_agent_and_clears_buffer() -> No
     assert update_time >= 0.0
 
 
-def test_graph_gat_mappo_reuses_epoch_embeddings_for_actor_and_critic() -> None:
-    """PPO update should not encode the same graph twice in one epoch."""
+def test_graph_gat_mappo_encodes_local_actor_and_global_critic_graphs() -> None:
+    """PPO update should encode local actor graphs and one global critic graph."""
     agent = GraphGATMAPPOAgent(
         num_devices=2,
         num_servers=2,
@@ -316,5 +371,7 @@ def test_graph_gat_mappo_reuses_epoch_embeddings_for_actor_and_critic() -> None:
 
     agent.update_from_rollout(buffer)
 
-    expected_encode_calls = transition_count * (2 + agent.ppo_epochs)
+    expected_encode_calls = transition_count * (
+        2 + agent.ppo_epochs * (agent.num_devices + 1)
+    )
     assert encode_call_count == expected_encode_calls

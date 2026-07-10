@@ -4,6 +4,7 @@ This script trains multiple algorithms on the DITEN environment and
 generates plots and JSON summaries for reward, delay, and energy.
 """
 
+import argparse
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -41,6 +42,13 @@ from ultils.experiment_setup import (
 )
 from ultils.paper_config import PAPER_PARAMS
 from ultils.topology_graph_state import TopologyGraphState, build_topology_graph_state
+from ultils.topology_scenarios import (
+    TopologyScenario,
+    available_topology_scenario_names,
+    compute_topology_metrics,
+    device_start_points,
+    get_topology_scenario,
+)
 import time
 
 
@@ -63,6 +71,98 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse comparison-runner CLI arguments."""
+    provisional = PAPER_PARAMS["provisional_table2_needed"]
+    parser = argparse.ArgumentParser(description="Run DITEN comparison experiments.")
+    parser.add_argument(
+        "--topology-scenario",
+        default=str(provisional["topology_scenario"]),
+        choices=available_topology_scenario_names(),
+        help="Named topology scenario to run.",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+        help="Override comparison_full_episodes for smoke or short runs.",
+    )
+    parser.add_argument(
+        "--baseline-episodes",
+        type=int,
+        default=None,
+        help="Override baseline_evaluation_episodes.",
+    )
+    return parser.parse_args()
+
+
+def build_servers_for_scenario(
+    scenario: TopologyScenario,
+    confirmed: Dict[str, float],
+    provisional: Dict[str, float],
+) -> List[EdgeServer]:
+    """Build edge servers from a named topology scenario."""
+    servers = []
+    for server_index, location in enumerate(scenario.server_locations, start=1):
+        servers.append(
+            EdgeServer(
+                server_index,
+                np.asarray(location, dtype=float),
+                np.random.uniform(
+                    provisional["server_compute_power_min_ghz"],
+                    provisional["server_compute_power_max_ghz"],
+                )
+                * 1e9,
+                confirmed["server_tx_power_w"],
+                confirmed["server_energy_coeff"],
+                coverage_radius=scenario.coverage_radius,
+            )
+        )
+    return servers
+
+
+def build_devices_for_scenario(
+    scenario: TopologyScenario,
+    confirmed: Dict[str, float],
+    provisional: Dict[str, float],
+) -> List[IndustrialDevice]:
+    """Build mobile devices from a named topology scenario."""
+    starts = device_start_points(scenario)
+    devices = []
+    for device_index, start_location in enumerate(starts, start=1):
+        devices.append(
+            IndustrialDevice(
+                device_index,
+                start_location.copy(),
+                np.random.uniform(
+                    provisional["device_compute_power_min_ghz"],
+                    provisional["device_compute_power_max_ghz"],
+                )
+                * 1e9,
+                confirmed["device_tx_power_w"],
+                confirmed["device_energy_coeff"],
+                speed_mps=confirmed["device_speed_mps"],
+            )
+        )
+    return devices
+
+
+def flatten_topology_metrics(topology_metrics: Dict[str, object]) -> Dict[str, object]:
+    """Flatten topology metrics for JSONL/checkpoint metadata."""
+    route_samples = topology_metrics["route_samples"]
+    return {
+        "topology_scenario": topology_metrics["name"],
+        "topology_num_devices": topology_metrics["num_devices"],
+        "topology_num_servers": topology_metrics["num_servers"],
+        "topology_coverage_radius_m": topology_metrics["coverage_radius_m"],
+        "topology_avg_feasible_servers": route_samples["avg_feasible_servers"],
+        "topology_density": route_samples["density"],
+        "topology_zero_link_ratio": route_samples["zero_link_ratio"],
+        "topology_multi_link_ratio": route_samples["multi_link_ratio"],
+        "topology_device_server_ratio": route_samples["device_server_ratio"],
+    }
 
 
 def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
@@ -88,40 +188,40 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
         #         "epsilon_min": provisional["epsilon_min"],
         #         "decay": provisional["epsilon_decay"],
         #     },
-        "MADDPG": {
-            "class": EpsilonATNMADDPGAgent,
-            "kwargs": {
-                "use_attention": False,
-                "use_epsilon_greedy": False,
-                "lr": confirmed["rl_lr"],
-                "epsilon_init": provisional["epsilon_init"],
-                "epsilon_min": provisional["epsilon_min"],
-                "decay": provisional["epsilon_decay"],
-            },
-        },
-        "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
-        "MAPPO": {
-            "class": MAPPOAgent,
-            "kwargs": {
-                "lr": confirmed["rl_lr"],
-                "gamma": provisional["gamma"],
-                "clip_param": provisional["mappo_clip_param"],
-                "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
-                "use_action_mask": False,
-            },
-        },
-        "Mask-MAPPO": {
-            "class": MAPPOAgent,
-            "kwargs": {
-                "lr": confirmed["rl_lr"],
-                "gamma": provisional["gamma"],
-                "clip_param": provisional["mappo_clip_param"],
-                "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
-                "use_action_mask": provisional["mappo_use_action_mask"],
-            },
-        },
+        # "MADDPG": {
+        #     "class": EpsilonATNMADDPGAgent,
+        #     "kwargs": {
+        #         "use_attention": False,
+        #         "use_epsilon_greedy": False,
+        #         "lr": confirmed["rl_lr"],
+        #         "epsilon_init": provisional["epsilon_init"],
+        #         "epsilon_min": provisional["epsilon_min"],
+        #         "decay": provisional["epsilon_decay"],
+        #     },
+        # },
+        # "MAAC": {"class": MAACAgent, "kwargs": {"lr": confirmed["rl_lr"]}},
+        # "MAPPO": {
+        #     "class": MAPPOAgent,
+        #     "kwargs": {
+        #         "lr": confirmed["rl_lr"],
+        #         "gamma": provisional["gamma"],
+        #         "clip_param": provisional["mappo_clip_param"],
+        #         "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
+        #         "use_action_mask": False,
+        #     },
+        # },
+        # "Mask-MAPPO": {
+        #     "class": MAPPOAgent,
+        #     "kwargs": {
+        #         "lr": confirmed["rl_lr"],
+        #         "gamma": provisional["gamma"],
+        #         "clip_param": provisional["mappo_clip_param"],
+        #         "ppo_epochs": int(provisional["mappo_ppo_epochs"]),
+        #         "use_action_mask": provisional["mappo_use_action_mask"],
+        #     },
+        # },
 
-        "GAT-MAPPO": {
+        "Graph-GAT MAPPO": {
             "class": GraphGATMAPPOAgent,
             "kwargs": {
                 "lr": confirmed["rl_lr"],
@@ -131,10 +231,21 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "clip_param": provisional["graph_gat_clip_param"],
                 "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
                 "use_action_mask": False,
-                # "device": provisional["graph_gat_device"],
             },
         },
-        "GAT-Mask MAPPO": {
+        # "Graph-GAT Mask MAPPO": {
+        #     "class": GraphGATMAPPOAgent,
+        #     "kwargs": {
+        #         "lr": confirmed["rl_lr"],
+        #         "gamma": provisional["gamma"],
+        #         "hidden_dim": int(provisional["graph_gat_hidden_dim"]),
+        #         "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
+        #         "clip_param": provisional["graph_gat_clip_param"],
+        #         "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+        #         "use_action_mask": provisional["graph_gat_use_action_mask"],
+        #     },
+        # },
+        "Graph-GAT Warmup Mask MAPPO": {
             "class": GraphGATMAPPOAgent,
             "kwargs": {
                 "lr": confirmed["rl_lr"],
@@ -144,7 +255,13 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "clip_param": provisional["graph_gat_clip_param"],
                 "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
                 "use_action_mask": provisional["graph_gat_use_action_mask"],
-                # "device": provisional["graph_gat_device"],
+                "topology_warmup_episodes": int(
+                    provisional["graph_gat_topology_warmup_episodes"]
+                ),
+                "topology_warmup_updates_per_step": int(
+                    provisional["graph_gat_topology_warmup_updates_per_step"]
+                ),
+                "topology_warmup_lr": provisional["graph_gat_topology_warmup_lr"],
             },
         },
 
@@ -182,7 +299,10 @@ def _build_plot_results(
 
 
 def _last_training_state_line(
-    algo_name: str, history: Dict[str, List[float]], episode_count: int
+    algo_name: str,
+    history: Dict[str, List[float]],
+    episode_count: int,
+    topology_metrics: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """Build one flat JSONL row for the final training state of one model."""
     def last_value(metric_name: str) -> float:
@@ -194,7 +314,7 @@ def _last_training_state_line(
     resolved_local = int(round(last_value("resolved_local_count")))
     resolved_edge = int(round(last_value("resolved_edge_count")))
 
-    return {
+    row = {
         "model": algo_name,
         "episode": int(episode_count),
         "reward": last_value("reward"),
@@ -214,7 +334,13 @@ def _last_training_state_line(
         "wait_time_s": last_value("queue_or_wait_time"),
         "penalty_count": int(round(last_value("penalty_count"))),
         "penalty_time_s": last_value("penalty_time"),
+        "graph_warmup_time_s": last_value("graph_warmup_time"),
+        "graph_warmup_loss": last_value("graph_warmup_loss"),
+        "graph_warmup_count": int(round(last_value("graph_warmup_count"))),
     }
+    if topology_metrics is not None:
+        row.update(flatten_topology_metrics(topology_metrics))
+    return row
 
 
 def _write_last_training_state_jsonl(
@@ -269,6 +395,7 @@ def _build_model_checkpoint(
     num_servers: int,
     graph_node_feature_dim: Optional[int] = None,
     graph_edge_feature_dim: Optional[int] = None,
+    topology_metrics: Optional[Dict[str, object]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build a serializable checkpoint payload for a trainable algorithm."""
     agent_states = [
@@ -294,8 +421,12 @@ def _build_model_checkpoint(
         "num_devices": int(num_devices),
         "num_servers": int(num_servers),
         "agents": trainable_agent_states,
-        "final_metrics": _last_training_state_line(algo_name, history, episode_count),
+        "final_metrics": _last_training_state_line(
+            algo_name, history, episode_count, topology_metrics=topology_metrics
+        ),
     }
+    if topology_metrics is not None:
+        checkpoint["topology_metrics"] = topology_metrics
     if graph_node_feature_dim is not None or graph_edge_feature_dim is not None:
         checkpoint["graph_dims"] = {
             "node_feature_dim": graph_node_feature_dim,
@@ -387,7 +518,8 @@ def _collect_graph_gat_actions(
     joint_state: np.ndarray,
     num_devices: int,
     num_servers: int,
-) -> Tuple[List[int], int, int, List[float], TopologyGraphState, float, float]:
+    episode_index: int,
+) -> Tuple[List[int], int, int, List[float], TopologyGraphState, float, float, float, float]:
     """Build graph state and select Graph-GAT MAPPO joint actions.
 
     Args:
@@ -398,7 +530,7 @@ def _collect_graph_gat_actions(
 
     Returns:
         Joint actions, local count, edge count, old log-probs, graph state, graph
-        build time, and action selection time.
+        build time, topology warmup time/loss, and action selection time.
     """
     graph_build_start = time.perf_counter()
     graph_state = build_topology_graph_state(
@@ -407,6 +539,15 @@ def _collect_graph_gat_actions(
         num_servers=num_servers,
     )
     graph_build_time = time.perf_counter() - graph_build_start
+
+    graph_warmup_time = 0.0
+    graph_warmup_loss = 0.0
+    if agent.should_warmup_topology(episode_index):
+        graph_warmup_start = time.perf_counter()
+        graph_warmup_loss = agent.warmup_topology_encoder(
+            graph_state, agent.topology_warmup_updates_per_step
+        )
+        graph_warmup_time = time.perf_counter() - graph_warmup_start
 
     graph_action_start = time.perf_counter()
     joint_actions, old_log_probs = agent.select_actions_with_log_probs(graph_state)
@@ -420,6 +561,8 @@ def _collect_graph_gat_actions(
         old_log_probs,
         graph_state,
         graph_build_time,
+        graph_warmup_time,
+        graph_warmup_loss,
         graph_action_time,
     )
 
@@ -500,10 +643,15 @@ def _format_diagnostic_summary(algo_name: str, episode_number: int, history: Dic
     graph_transition_count = history.get("graph_transition_count", [0.0])[-1]
     if graph_transition_count > 0:
         graph_build_time = history["graph_build_time"][-1]
+        graph_warmup_time = history.get("graph_warmup_time", [0.0])[-1]
+        graph_warmup_loss = history.get("graph_warmup_loss", [0.0])[-1]
+        graph_warmup_count = history.get("graph_warmup_count", [0.0])[-1]
         graph_action_time = history["graph_action_time"][-1]
         graph_update_time = history["graph_update_time"][-1]
         summary += (
             f"\n  Graph-GAT cost:    build={graph_build_time:.3f}s "
+            f"warmup={graph_warmup_time:.3f}s/{graph_warmup_count:.0f} "
+            f"warmup_loss={graph_warmup_loss:.4f} "
             f"action={graph_action_time:.3f}s update={graph_update_time:.3f}s "
             f"transitions={graph_transition_count:.0f}"
         )
@@ -630,6 +778,8 @@ def train_algorithm(
     priority_model: torch.nn.Module,
     num_episodes: int,
     priority_mode: str = "gcn",
+    topology_scenario: Optional[TopologyScenario] = None,
+    topology_metrics: Optional[Dict[str, object]] = None,
 ) -> Tuple[Dict[str, List[float]], Optional[Dict[str, Any]]]:
     """Train one algorithm configuration and return metrics and checkpoint.
 
@@ -643,12 +793,14 @@ def train_algorithm(
         priority_model: GCN/GAT model used for priority extraction.
         num_episodes: Number of episodes to train.
         priority_mode: Scheduling mode ("gcn", "gat", "random", "greedy").
+        topology_scenario: Optional named topology scenario for mobility routes.
+        topology_metrics: Optional topology metrics stored in checkpoints.
 
     Returns:
         Tuple of metric history and optional trainable model checkpoint payload.
     """
     print(f"\n{'='*50}\nStarting Training for: {algo_name}\n{'='*50}")
-    set_seed(64)  # Reset seed for fair comparison
+    set_seed(75)  # Reset seed for fair comparison
     confirmed = PAPER_PARAMS["confirmed"]
     provisional = PAPER_PARAMS["provisional_table2_needed"]
 
@@ -668,6 +820,9 @@ def train_algorithm(
         p_out_value=provisional["p_out_value"],
         local_estimation_error=provisional["local_estimation_error"],
         edge_estimation_error=provisional["edge_estimation_error"],
+        route_rectangles=(
+            topology_scenario.route_rectangles if topology_scenario is not None else None
+        ),
     )
     # State/Action dimensions
     STATE_DIM = env.get_state_dim()
@@ -730,6 +885,9 @@ def train_algorithm(
         "resolved_local_count": [],
         "resolved_edge_count": [],
         "graph_build_time": [],
+        "graph_warmup_time": [],
+        "graph_warmup_loss": [],
+        "graph_warmup_count": [],
         "graph_action_time": [],
         "graph_update_time": [],
         "graph_transition_count": [],
@@ -755,6 +913,9 @@ def train_algorithm(
         slot_resolved_local_counts = []
         slot_resolved_edge_counts = []
         episode_graph_build_time = 0.0
+        episode_graph_warmup_time = 0.0
+        episode_graph_warmup_loss_total = 0.0
+        episode_graph_warmup_count = 0.0
         episode_graph_action_time = 0.0
         episode_graph_update_time = 0.0
         episode_graph_transition_count = 0.0
@@ -788,14 +949,21 @@ def train_algorithm(
                         old_log_probs,
                         graph_state,
                         graph_build_time,
+                        graph_warmup_time,
+                        graph_warmup_loss,
                         graph_action_time,
                     ) = _collect_graph_gat_actions(
                         agent=agents[0],
                         joint_state=current_joint_state,
                         num_devices=len(devices),
                         num_servers=len(servers),
+                        episode_index=episode,
                     )
                     episode_graph_build_time += graph_build_time
+                    episode_graph_warmup_time += graph_warmup_time
+                    if graph_warmup_time > 0.0:
+                        episode_graph_warmup_loss_total += graph_warmup_loss
+                        episode_graph_warmup_count += 1.0
                     episode_graph_action_time += graph_action_time
                 else:
                     joint_actions, local_count, edge_count = _collect_joint_actions(
@@ -929,6 +1097,11 @@ def train_algorithm(
                 agents[0], graph_rollout_buffer, gamma
             )
         history["graph_build_time"].append(episode_graph_build_time)
+        history["graph_warmup_time"].append(episode_graph_warmup_time)
+        history["graph_warmup_loss"].append(
+            episode_graph_warmup_loss_total / max(episode_graph_warmup_count, 1.0)
+        )
+        history["graph_warmup_count"].append(episode_graph_warmup_count)
         history["graph_action_time"].append(episode_graph_action_time)
         history["graph_update_time"].append(episode_graph_update_time)
         history["graph_transition_count"].append(episode_graph_transition_count)
@@ -976,6 +1149,9 @@ def train_algorithm(
                 print(
                     f"[{algo_name}] Graph-GAT Cost | Build: "
                     f"{history['graph_build_time'][-1]:.3f}s "
+                    f"| Warmup: {history['graph_warmup_time'][-1]:.3f}s "
+                    f"/ {history['graph_warmup_count'][-1]:.0f} "
+                    f"| Warmup Loss: {history['graph_warmup_loss'][-1]:.4f} "
                     f"| Action: {history['graph_action_time'][-1]:.3f}s "
                     f"| Update: {history['graph_update_time'][-1]:.3f}s "
                     f"| Transitions: {history['graph_transition_count'][-1]:.0f}"
@@ -993,15 +1169,34 @@ def train_algorithm(
         num_servers=len(servers),
         graph_node_feature_dim=graph_node_feature_dim if uses_graph_gat_mappo else None,
         graph_edge_feature_dim=graph_edge_feature_dim if uses_graph_gat_mappo else None,
+        topology_metrics=topology_metrics,
     )
     return history, checkpoint
 
 if __name__ == "__main__":
     # 1. Base Environment Setup
+    args = parse_args()
     confirmed = PAPER_PARAMS["confirmed"]
     provisional = PAPER_PARAMS["provisional_table2_needed"]
     BANDWIDTH, NOISE_POWER = confirmed["bandwidth_hz"], confirmed["noise_power_dbm"]
-    NUM_DEVICES, NUM_SERVERS = int(confirmed["num_devices"]), int(confirmed["num_servers"])
+    topology_scenario = get_topology_scenario(args.topology_scenario)
+    topology_metrics = compute_topology_metrics(topology_scenario)
+    flat_topology_metrics = flatten_topology_metrics(topology_metrics)
+
+    print(
+        "Topology scenario: "
+        f"{topology_scenario.name} "
+        f"({topology_scenario.device_count} devices / "
+        f"{len(topology_scenario.server_locations)} servers, "
+        f"radius={topology_scenario.coverage_radius}m)"
+    )
+    print(
+        "Topology metrics: "
+        f"avg_links={flat_topology_metrics['topology_avg_feasible_servers']:.2f}, "
+        f"density={flat_topology_metrics['topology_density']:.2f}, "
+        f"zero={flat_topology_metrics['topology_zero_link_ratio']:.2f}, "
+        f"multi={flat_topology_metrics['topology_multi_link_ratio']:.2f}"
+    )
     
     network_env = NetworkEnvironment(bandwidth=BANDWIDTH, noise_power_dbm=NOISE_POWER)
     data_loader = KolektorSDDLoader(dataset_path="dataset/KolektorSDD/")
@@ -1034,47 +1229,8 @@ if __name__ == "__main__":
         model_label=priority_model_name.upper(),
     )
     
-    # Fixed Edge Servers (User-confirmed Fig.4 topology)
-    server_locations = [np.array([20.0, 30.0]), np.array([45.0, 50.0]), np.array([70.0, 20.0])]
-    servers = [
-        EdgeServer(
-            j + 1,
-            loc,
-            np.random.uniform(
-                provisional["server_compute_power_min_ghz"],
-                provisional["server_compute_power_max_ghz"],
-            )
-            * 1e9,
-            confirmed["server_tx_power_w"],
-            confirmed["server_energy_coeff"],
-            coverage_radius=confirmed["coverage_radius_m"],
-        )
-        for j, loc in enumerate(server_locations)
-    ]
-
-    # 10 devices: each pair shares one fixed rectangular route (starting at first waypoint)
-    robot_starts = [
-        np.array([10.0, 10.0]), np.array([30.0, 30.0]),
-        np.array([70.0, 10.0]), np.array([40.0, 20.0]),
-        np.array([40.0, 20.0]), np.array([60.0, 50.0]),
-        np.array([70.0, 10.0]), np.array([90.0, 40.0]),
-        np.array([65.0, 45.0]), np.array([90.0, 55.0]),
-    ]
-    devices = [
-        IndustrialDevice(
-            i + 1,
-            robot_starts[i],
-            np.random.uniform(
-                provisional["device_compute_power_min_ghz"],
-                provisional["device_compute_power_max_ghz"],
-            )
-            * 1e9,
-            confirmed["device_tx_power_w"],
-            confirmed["device_energy_coeff"],
-            speed_mps=confirmed["device_speed_mps"],
-        )
-        for i in range(NUM_DEVICES)
-    ]
+    servers = build_servers_for_scenario(topology_scenario, confirmed, provisional)
+    devices = build_devices_for_scenario(topology_scenario, confirmed, provisional)
 
     # 2. Define Algorithms to Compare
     algorithms = build_algorithm_configs()
@@ -1082,8 +1238,16 @@ if __name__ == "__main__":
     # 3. Run Comparisons
     results = {"reward": {}, "delay": {}, "energy": {}}
     priority_results = {"reward": {}, "delay": {}, "energy": {}}
-    FULL_EPISODES = int(provisional["comparison_full_episodes"])
-    BASELINE_EVALUATION_EPISODES = int(provisional["baseline_evaluation_episodes"])
+    FULL_EPISODES = (
+        int(args.episodes)
+        if args.episodes is not None
+        else int(provisional["comparison_full_episodes"])
+    )
+    BASELINE_EVALUATION_EPISODES = (
+        int(args.baseline_episodes)
+        if args.baseline_episodes is not None
+        else int(provisional["baseline_evaluation_episodes"])
+    )
     algorithm_episode_counts = {}
     last_training_state_rows = []
     model_checkpoints = []
@@ -1135,12 +1299,19 @@ if __name__ == "__main__":
             num_episodes=run_episodes,
             priority_model=priority_model,
             priority_mode=priority_model_name,
+            topology_scenario=topology_scenario,
+            topology_metrics=topology_metrics,
         )
         results["reward"][algo_name] = history["reward"]
         results["delay"][algo_name] = history["delay"]
         results["energy"][algo_name] = history["energy"]
         last_training_state_rows.append(
-            _last_training_state_line(algo_name, history, episode_count=run_episodes)
+            _last_training_state_line(
+                algo_name,
+                history,
+                episode_count=run_episodes,
+                topology_metrics=topology_metrics,
+            )
         )
         if checkpoint is not None:
             model_checkpoints.append(checkpoint)

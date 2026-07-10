@@ -60,6 +60,30 @@ class GraphGATValueCritic(nn.Module):
         return self.fc3(x)
 
 
+class TopologyWarmupHead(nn.Module):
+    """Predict link feasibility and window quality from local device embeddings."""
+
+    def __init__(self, embedding_dim: int, num_servers: int, hidden_dim: int = 64):
+        """Initialize topology warmup prediction head.
+
+        Args:
+            embedding_dim: Device embedding dimension from local GAT subgraph.
+            num_servers: Number of edge servers.
+            hidden_dim: Hidden layer width.
+        """
+        super(TopologyWarmupHead, self).__init__()
+        self.fc1 = nn.Linear(embedding_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.feasible_head = nn.Linear(hidden_dim, num_servers)
+        self.window_head = nn.Linear(hidden_dim, num_servers)
+
+    def forward(self, local_embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return feasible logits and normalized window estimates per server."""
+        x = F.relu(self.fc1(local_embeddings))
+        x = F.relu(self.fc2(x))
+        return self.feasible_head(x), torch.sigmoid(self.window_head(x))
+
+
 @dataclass(frozen=True)
 class GraphGATTransition:
     """One on-policy Graph-GAT MAPPO transition."""
@@ -129,6 +153,9 @@ class GraphGATMAPPOAgent:
         clip_param: float = 0.2,
         ppo_epochs: int = 4,
         use_action_mask: bool = True,
+        topology_warmup_episodes: int = 0,
+        topology_warmup_updates_per_step: int = 0,
+        topology_warmup_lr: float = 0.001,
     ):
         """Initialize Graph-GAT MAPPO.
 
@@ -144,13 +171,19 @@ class GraphGATMAPPOAgent:
             clip_param: PPO clipping parameter.
             ppo_epochs: PPO epochs per rollout update.
             use_action_mask: Whether to mask disconnected edge-server actions.
+            topology_warmup_episodes: Number of first episodes using online GAT warmup.
+            topology_warmup_updates_per_step: Auxiliary GAT updates before action selection.
+            topology_warmup_lr: Learning rate for topology warmup optimizer.
         """
         self.num_devices = num_devices
+        self.num_servers = num_servers
         self.action_dim = num_servers + 1
         self.gamma = gamma
         self.clip_param = clip_param
         self.ppo_epochs = ppo_epochs
         self.use_action_mask = use_action_mask
+        self.topology_warmup_episodes = topology_warmup_episodes
+        self.topology_warmup_updates_per_step = topology_warmup_updates_per_step
 
         self.encoder = TopologyGATEncoder(
             node_feature_dim=node_feature_dim,
@@ -168,11 +201,20 @@ class GraphGATMAPPOAgent:
             num_devices=num_devices,
             hidden_dim=hidden_dim,
         )
+        self.topology_warmup_head = TopologyWarmupHead(
+            embedding_dim=embedding_dim,
+            num_servers=num_servers,
+            hidden_dim=hidden_dim,
+        )
         self.optimizer = optim.Adam(
             list(self.encoder.parameters())
             + list(self.actor.parameters())
             + list(self.critic.parameters()),
             lr=lr,
+        )
+        self.topology_warmup_optimizer = optim.Adam(
+            list(self.encoder.parameters()) + list(self.topology_warmup_head.parameters()),
+            lr=topology_warmup_lr,
         )
 
     def select_actions_with_log_probs(
@@ -180,10 +222,7 @@ class GraphGATMAPPOAgent:
     ) -> Tuple[List[int], List[float]]:
         """Sample one offloading action per device from graph embeddings."""
         with torch.no_grad():
-            device_embeddings = self._encode_graph(graph_state)
-            probabilities = self._masked_action_probabilities(
-                self.actor(device_embeddings), graph_state
-            )
+            probabilities = self._actor_probabilities_for_graph_state(graph_state)
             distribution = Categorical(probabilities)
             actions = distribution.sample()
             log_probs = distribution.log_prob(actions)
@@ -251,6 +290,149 @@ class GraphGATMAPPOAgent:
             graph_state.device_node_indices,
         )
 
+    def should_warmup_topology(self, episode_index: int) -> bool:
+        """Return whether online topology warmup is active for this episode."""
+        return (
+            self.topology_warmup_episodes > 0
+            and self.topology_warmup_updates_per_step > 0
+            and episode_index < self.topology_warmup_episodes
+        )
+
+    def warmup_topology_encoder(
+        self, graph_state: TopologyGraphState, update_count: int
+    ) -> float:
+        """Train topology encoder on link feasibility/window labels."""
+        if update_count <= 0:
+            return 0.0
+
+        feasible_targets, window_targets = self._topology_warmup_targets(graph_state)
+        last_loss = 0.0
+        for _ in range(update_count):
+            local_embeddings = self._encode_local_actor_embeddings(graph_state)
+            feasible_logits, window_estimates = self.topology_warmup_head(
+                local_embeddings
+            )
+            feasible_loss = F.binary_cross_entropy_with_logits(
+                feasible_logits, feasible_targets
+            )
+            window_loss = F.mse_loss(window_estimates, window_targets)
+            loss = feasible_loss + 0.5 * window_loss
+
+            self.topology_warmup_optimizer.zero_grad()
+            loss.backward()
+            self.topology_warmup_optimizer.step()
+            last_loss = float(loss.detach().item())
+
+        return last_loss
+
+    def _topology_warmup_targets(
+        self, graph_state: TopologyGraphState
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build feasible-link and window-length labels from graph edges."""
+        device = graph_state.node_features.device
+        feasible_targets = torch.zeros(
+            (self.num_devices, self.num_servers),
+            dtype=torch.float32,
+            device=device,
+        )
+        window_targets = torch.zeros_like(feasible_targets)
+        server_to_index = {
+            int(server_node): server_index
+            for server_index, server_node in enumerate(
+                graph_state.server_node_indices.tolist()
+            )
+        }
+
+        for edge_position, (source_node, target_node) in enumerate(
+            graph_state.edge_index.transpose(0, 1).tolist()
+        ):
+            if source_node >= self.num_devices or target_node not in server_to_index:
+                continue
+            server_index = server_to_index[target_node]
+            edge_features = graph_state.edge_features[edge_position]
+            feasible_targets[source_node, server_index] = edge_features[2]
+            window_targets[source_node, server_index] = edge_features[6]
+
+        return feasible_targets, window_targets
+
+    def _actor_probabilities_for_graph_state(
+        self, graph_state: TopologyGraphState
+    ) -> torch.Tensor:
+        """Return actor probabilities from per-device local subgraph embeddings."""
+        local_embeddings = self._encode_local_actor_embeddings(graph_state)
+        probabilities = self.actor(local_embeddings)
+        return self._masked_action_probabilities(probabilities, graph_state)
+
+    def _encode_local_actor_embeddings(
+        self, graph_state: TopologyGraphState
+    ) -> torch.Tensor:
+        """Encode each device using only its device-server local subgraph."""
+        local_embeddings = []
+        for device_index in range(self.num_devices):
+            local_graph_state = self._local_subgraph_for_device(
+                graph_state, device_index
+            )
+            local_embeddings.append(self._encode_graph(local_graph_state)[0])
+        return torch.stack(local_embeddings, dim=0)
+
+    def _local_subgraph_for_device(
+        self, graph_state: TopologyGraphState, device_index: int
+    ) -> TopologyGraphState:
+        """Build one actor subgraph with one device node and all server nodes."""
+        device = graph_state.node_features.device
+        source_device_node = int(graph_state.device_node_indices[device_index])
+        source_server_nodes = [
+            int(server_node) for server_node in graph_state.server_node_indices.tolist()
+        ]
+        source_nodes = [source_device_node] + source_server_nodes
+        local_index_by_source = {
+            source_node: local_index
+            for local_index, source_node in enumerate(source_nodes)
+        }
+
+        node_features = graph_state.node_features[
+            torch.tensor(source_nodes, dtype=torch.long, device=device)
+        ]
+        edge_pairs: List[Tuple[int, int]] = []
+        edge_features = []
+        for edge_position, (source_node, target_node) in enumerate(
+            graph_state.edge_index.transpose(0, 1).tolist()
+        ):
+            if source_node not in local_index_by_source:
+                continue
+            if target_node not in local_index_by_source:
+                continue
+            if source_device_node not in (source_node, target_node):
+                continue
+            edge_pairs.append(
+                (
+                    local_index_by_source[source_node],
+                    local_index_by_source[target_node],
+                )
+            )
+            edge_features.append(graph_state.edge_features[edge_position])
+
+        if edge_pairs:
+            edge_index = torch.tensor(
+                edge_pairs, dtype=torch.long, device=device
+            ).transpose(0, 1)
+            edge_feature_tensor = torch.stack(edge_features, dim=0)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+            edge_feature_tensor = graph_state.edge_features.new_empty(
+                (0, graph_state.edge_features.shape[1])
+            )
+
+        return TopologyGraphState(
+            node_features=node_features,
+            edge_index=edge_index,
+            edge_features=edge_feature_tensor,
+            device_node_indices=torch.tensor([0], dtype=torch.long, device=device),
+            server_node_indices=torch.arange(
+                1, self.num_servers + 1, dtype=torch.long, device=device
+            ),
+        )
+
     def _action_mask_for_graph_state(
         self, graph_state: TopologyGraphState
     ) -> torch.Tensor:
@@ -314,13 +496,11 @@ class GraphGATMAPPOAgent:
         entropy_rows = []
         value_rows = []
         for graph_index, graph_state in enumerate(graph_states):
-            device_embeddings = self._encode_graph(graph_state)
-            probabilities = self._masked_action_probabilities(
-                self.actor(device_embeddings), graph_state
-            )
+            probabilities = self._actor_probabilities_for_graph_state(graph_state)
             distribution = Categorical(probabilities)
             log_prob_rows.append(distribution.log_prob(actions[graph_index]))
             entropy_rows.append(distribution.entropy())
+            device_embeddings = self._encode_graph(graph_state)
             value_rows.append(self.critic(device_embeddings))
 
         return (

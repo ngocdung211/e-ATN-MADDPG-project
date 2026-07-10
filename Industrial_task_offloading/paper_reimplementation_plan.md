@@ -12,6 +12,260 @@
 
 ---
 
+## Active Research Plan - 2026-07-08
+
+**Status:** This section is the active plan. Older open queues below are historical context unless a task is explicitly moved here.
+
+**Current research questions:**
+- Does `Graph-GAT Mask MAPPO` fail because the topology encoder is trained from scratch inside PPO?
+- Does `Graph-GAT Mask MAPPO` help more when the topology is larger, denser, and harder than the current 10-device/3-server map?
+- How can we prove `GAT Scheduling` is better than `GCN Scheduling` for task priority, instead of only showing one lucky training curve?
+
+**Success criteria:**
+- Pretrained Topology-GAT experiments compare at least three variants under the same seeds and episode budget: scratch, pretrained-frozen, and pretrained-finetuned.
+- Larger-topology experiments report topology complexity metrics, not only reward/delay/energy.
+- GAT-vs-GCN task-priority evidence is separated into supervised priority quality, fixed-policy scheduling quality, and end-to-end DRL impact.
+- Every result includes the exact config, checkpoint path, seed list, final JSONL row, and plot path.
+
+### Phase 0: Close the Previous Plan and Fix Drift
+
+Goal: make the plan match the code before adding new experiments.
+
+- [x] Treat the old `Next Task Queue`, old `Ablation Study Queue`, and old `Implementation Checklist` as historical context.
+- [x] Move the remaining active work into this 2026-07-08 section.
+- [ ] Repair the local CPU PyTorch runtime before trusting tests on this Mac.
+  - Current blocker: importing `torch` fails because `libtorch_cpu.dylib` is missing from the checked Conda environments.
+  - Verify: `python -c "import torch; print(torch.__version__)"` works in the selected project environment.
+- [x] Align model names across plan, config, tests, plots, and JSONL.
+  - Standard names: `Graph-GAT MAPPO` for the unmasked ablation and `Graph-GAT Mask MAPPO` for the masked proposal.
+  - Reason: these names make clear that the GAT is the topology encoder, not the task-priority GAT.
+  - Verify: `tests/test_graph_gat_mappo.py` expects the same names returned by `run_comparision.build_algorithm_configs`.
+- [x] Drop GPU-device work from the active plan.
+  - Decision: keep `GraphGATMAPPOAgent` as CPU/default-device code for now.
+  - Impact: do not add a `device` argument, do not pass `graph_gat_device`, and do not plan Windows GPU smoke runs in the active queue.
+
+### Phase 1: Pretrained Topology-GAT Experiment
+
+Goal: test whether the topology encoder helps more when it starts from useful topology knowledge instead of random weights.
+
+Assumption: pretraining should learn connection feasibility and topology quality from graph states before PPO begins. PPO then either freezes that encoder or fine-tunes it.
+
+1. [ ] **Define the Topology-GAT pretraining target**
+   - Input: `TopologyGraphState` from `ultils/topology_graph_state.py`.
+   - Encoder: `models/topology_gat.py::TopologyGATEncoder`.
+   - Minimal supervised target:
+     - per-device feasible server mask from edge feature `is_connected`;
+     - optional per-device best-server target using lowest edge wait and longest valid window.
+   - Verify:
+     - target can be computed from graph tensors only;
+     - no environment physics or reward function changes.
+
+2. [ ] **Add topology pretraining dataset generation**
+   - Goal: collect graph states from random or scripted rollouts without training MAPPO.
+   - Candidate file: `ultils/topology_gat_pretraining.py`.
+   - Output:
+     - train/validation graph samples;
+     - feasible action mask targets;
+     - optional best-server labels.
+   - Verify:
+     - dataset contains connected and disconnected links;
+     - report average feasible servers per device.
+
+3. [ ] **Train and save a pretrained Topology-GAT checkpoint**
+   - Candidate checkpoint: `models/checkpoints/topology_gat_pretrained.pt`.
+   - Metrics:
+     - feasible-mask binary accuracy or F1;
+     - best-server accuracy if the best-server head is used;
+     - validation loss.
+   - Verify:
+     - checkpoint saves encoder weights separately from the pretraining head;
+     - loading the encoder into `GraphGATMAPPOAgent` changes initial encoder weights.
+
+4. [ ] **Add three Graph-GAT MAPPO topology modes**
+   - `scratch`: current behavior, encoder trains from random initialization during PPO.
+   - `pretrained_frozen`: load pretrained encoder, freeze encoder, train actor and critic only.
+   - `pretrained_finetune`: load pretrained encoder and continue PPO updates through encoder.
+   - Verify:
+     - frozen mode excludes encoder parameters from the optimizer;
+     - finetune mode includes encoder parameters in the optimizer;
+     - all three modes produce one final JSONL row with mode name and checkpoint path.
+
+5. [ ] **Run smoke tests for all topology modes**
+   - Run: 1-3 episodes each.
+   - Compare:
+     - `Graph-GAT Mask MAPPO scratch`;
+     - `Graph-GAT Mask MAPPO pretrained_frozen`;
+     - `Graph-GAT Mask MAPPO pretrained_finetune`.
+   - Verify:
+     - no crash;
+     - reward, delay, and energy are finite;
+     - requested edge actions do not target disconnected servers when mask is enabled;
+     - graph build/action/update cost is printed.
+
+6. [ ] **Run short learning comparison**
+   - Run: 10-30 episodes first, same seeds and same episode budget.
+   - Expected interpretation:
+     - frozen better than scratch means topology features are useful but PPO damages the encoder;
+     - finetune better than frozen means pretraining is useful and PPO can improve it;
+     - scratch matching both means current topology task may be too easy or features are already sufficient.
+
+### Phase 2: Larger and Denser Topology Stress Test
+
+Goal: test whether Graph-GAT Mask MAPPO only shows value when topology is complex enough.
+
+1. [x] **Add named topology scenario configs**
+   - Keep current paper-like scenario as `paper_10d_3s`.
+   - Add `medium_20d_6s`.
+   - Add `large_30d_10s`.
+   - Config controls:
+     - map size;
+     - number of devices;
+     - number of servers;
+     - server locations;
+     - coverage radius;
+     - device route templates.
+   - Verify:
+     - old `paper_10d_3s` results are reproducible with the new config path.
+     - Scenario source: `ultils/topology_scenarios.py`.
+     - Preview source: `ultils/topology_scenario_preview.py`.
+     - Runner selection: `run_comparision.py --topology-scenario <name>`.
+
+2. [x] **Add topology complexity diagnostics**
+   - Metrics:
+     - average feasible servers per device;
+     - percent of devices with zero feasible servers;
+     - graph edge count;
+     - graph density;
+     - edge request success rate;
+     - mask rejection count or masked-action count;
+     - graph build/action/update time.
+   - Verify:
+     - static scenario diagnostics are saved in final JSONL/checkpoints and printed before training.
+     - Static scenario diagnostics are saved in final JSONL/checkpoints:
+       `topology_avg_feasible_servers`, `topology_density`,
+       `topology_zero_link_ratio`, `topology_multi_link_ratio`, and
+       `topology_device_server_ratio`.
+
+3. [ ] **Run topology scale smoke tests**
+   - Run 1-3 episodes for:
+     - `Mask-MAPPO`;
+     - `Graph-GAT Mask MAPPO scratch`;
+     - best pretrained mode from Phase 1, if available.
+   - Scenarios:
+     - `paper_10d_3s`;
+     - `medium_20d_5s`;
+     - `large_30d_8s`.
+   - Verify:
+     - no scenario has impossible all-disconnected or all-connected topology unless intentionally configured;
+     - reward/delay/energy are finite.
+
+4. [ ] **Run controlled scale comparison**
+   - Run: same seeds, same episode count, same priority model, same reward config.
+   - Compare:
+     - `Mask-MAPPO`;
+     - `Graph-GAT Mask MAPPO scratch`;
+     - `Graph-GAT Mask MAPPO pretrained_frozen`;
+     - `Graph-GAT Mask MAPPO pretrained_finetune`.
+   - Success signal:
+     - GAT advantage should increase when average feasible server count and graph density increase.
+   - If GAT still equals Mask-MAPPO:
+     - inspect attention weights or edge-feature sensitivity;
+     - check whether flat state already gives MAPPO all topology information in an easy-to-learn order;
+     - do not tune reward before checking those explanations.
+
+### Phase 3: Prove GAT Task Priority Beats GCN Task Priority
+
+Goal: separate task-priority quality from offloading-policy quality.
+
+1. [ ] **Freeze the comparison protocol**
+   - Use the same DAG generator, train/validation split, model hidden size policy, optimizer, epochs, and seeds for GCN and GAT.
+   - Compare checkpoints:
+     - `models/checkpoints/gcn_priority.pt`;
+     - `models/checkpoints/gat_priority.pt`.
+   - Verify:
+     - both models train from scratch when running the priority-only comparison;
+     - old checkpoints do not leak into the comparison unless explicitly requested.
+
+2. [ ] **Run supervised priority-quality comparison**
+   - Metrics:
+     - validation loss against the current priority targets;
+     - topological-order validity rate;
+     - Kendall or Spearman rank agreement with target order if added.
+   - Success signal:
+     - GAT has lower validation loss or better ranking quality across multiple seeds.
+   - Caveat:
+     - if targets are simple hand-built labels, GAT beating GCN here only proves better fit to the current target, not better scheduling.
+
+3. [ ] **Run fixed-policy scheduling comparison**
+   - Goal: isolate priority order from RL learning.
+   - Keep the offloading policy fixed, for example:
+     - local-only;
+     - edge-only first-valid;
+     - a simple mask-aware heuristic.
+   - Compare priority modes:
+     - random;
+     - greedy;
+     - GCN;
+     - GAT.
+   - Metrics:
+     - reward;
+     - delay;
+     - energy;
+     - deadline/energy-constraint violation count if available.
+   - Success signal:
+     - GAT priority improves scheduling metrics under at least one fixed offloading policy without changing the DRL agent.
+
+4. [ ] **Run end-to-end DRL priority comparison**
+   - Keep the DRL algorithm fixed.
+   - Recommended first algorithm: `Graph-GAT Mask MAPPO pretrained_frozen` or current best stable MAPPO variant.
+   - Compare only the priority extractor:
+     - `priority_model = "gcn"`;
+     - `priority_model = "gat"`.
+   - Verify:
+     - same seeds;
+     - same topology scenario;
+     - same episode budget;
+     - same pretrained topology checkpoint mode if used.
+
+5. [ ] **Report statistical evidence**
+   - Use at least 3 seeds for smoke-level evidence and 5 seeds for final evidence.
+   - Report mean and standard deviation.
+   - Prefer paired comparison by seed.
+   - Claim “GAT priority is better” only if it wins in at least two evidence layers:
+     - supervised priority validation;
+     - fixed-policy scheduling;
+     - end-to-end DRL.
+
+### Recommended Execution Order
+
+1. Fix local CPU PyTorch so tests can run.
+2. Use `Graph-GAT MAPPO` / `Graph-GAT Mask MAPPO` names consistently between tests, config, plots, and result JSONL.
+3. Add pretrained Topology-GAT infrastructure and run 1-3 episode smoke tests.
+4. Run the default 10-device/3-server short comparison.
+5. Add larger topology configs and diagnostics.
+6. Run medium/large topology comparisons.
+7. Run GCN-vs-GAT priority evidence in supervised, fixed-policy, and end-to-end layers.
+
+### Optional Waiting List
+
+- [ ] **Graph-GAT MADDPG / GATMA-style CTDE**
+  - Actor: local graph/subgraph embedding to local action.
+  - Critic: global graph plus joint action to cooperative Q-value.
+  - Buffer/update: replay buffer, TD loss, target networks, soft update.
+  - Status: optional later ablation. Do not mix into current Graph-GAT MAPPO path.
+
+- [ ] **C-4 Graph-GAT topology warmup decay with hybrid link-quality loss**
+  - Current code stays on the simpler warmup design for now.
+  - Future schedule:
+    - episodes 0-4: train Topology-GAT 10 times per environment step before action selection;
+    - episodes 5-20: reduce to 1-2 topology updates per environment step;
+    - after episode 20: stop auxiliary topology warmup and let PPO continue normally.
+  - Future loss: `BCE(feasible_link) + MSE(edge_delay_estimate) + ranking_loss(server_quality)`.
+  - Purpose: avoid training Topology-GAT from scratch only through PPO, then test whether smoother warmup decay and richer link-quality supervision improve convergence.
+  - Status: optional future ablation, not part of the current implemented experiment.
+
+---
+
 ## Current Checkpoint - 2026-06-11
 
 **Status:** Environment is frozen for the first e-ATN-MADDPG sanity phase. The user manually fixed the environment and reported it is good enough for the model to run.
@@ -54,9 +308,9 @@ Interpretation:
 
 ---
 
-## Next Task Queue
+## Historical Task Queue - Superseded by Active Research Plan
 
-Stop after each task and wait for user verification.
+Historical note: this queue recorded the earlier paper-reimplementation path. Use the 2026-07-08 active research plan above for current work.
 
 1. [x] **Verify e-ATN-MADDPG agent mechanics**
    - Goal: Confirm current `EpsilonATNMADDPGAgent` can act and update before running longer training.
@@ -114,7 +368,7 @@ Stop after each task and wait for user verification.
      - comparison loop routes MAPPO through rollout update and clears the rollout after update. `DONE`
    - Verification: `PYTHONDONTWRITEBYTECODE=1 /Users/admin/miniconda3/bin/pytest tests/test_mappo_update.py -q -p no:cacheprovider`
 
-5. [ ] **Add e-ATN-MADDPG training diagnostics if smoke output is insufficient** `CURRENT`
+5. [ ] **Add e-ATN-MADDPG training diagnostics if smoke output is insufficient** `HISTORICAL`
    - Goal: Make model learning observable without changing env.
    - Candidate diagnostics:
      - actor loss.
@@ -202,9 +456,9 @@ Stop after each task and wait for user verification.
 
 ---
 
-## Ablation Study Queue - Graph-GAT State Encoder
+## Historical Ablation Study Queue - Graph-GAT State Encoder
 
-Purpose: test whether converting the flat environment state into a topology graph and encoding it with GAT gives DRL models a better state representation for task offloading.
+Historical purpose: test whether converting the flat environment state into a topology graph and encoding it with GAT gives DRL models a better state representation for task offloading. The current active version of this work is the pretrained Topology-GAT and topology stress-test plan above.
 
 Working assumption:
 - "Typology" means topology: device nodes, edge-server nodes, task/subtask features, connection-window features, queue/wait features, and feasible device-server links.
@@ -218,7 +472,7 @@ Working assumption:
   - flat-state MAPPO.
   - Graph-GAT MAPPO.
 
-Stop after each small task and wait for user verification.
+Historical note: this queue is preserved for traceability. Use the 2026-07-08 active research plan above for current work.
 
 1. [x] **Define graph-state representation**
    - Goal: Decide exactly how to convert current flat state into graph data.
@@ -479,7 +733,9 @@ Stop after each small task and wait for user verification.
 
 ---
 
-## Implementation Checklist
+## Historical Implementation Checklist
+
+Historical note: this checklist documents the original paper-reimplementation audit. Open boxes here are not the current execution queue unless they are moved into the active research plan above.
 
 ### Phase 1: Verification Scaffolding Before Behavior Changes
 
@@ -590,7 +846,9 @@ Stop after each small task and wait for user verification.
 
 ---
 
-## Immediate Next Step
+## Historical Immediate Next Step
+
+Historical note: this was the immediate next step for the older paper-reimplementation phase, not the current active research plan.
 
 Run the first frozen-env DRL task: verify the current `EpsilonATNMADDPGAgent` mechanics before any longer training run.
 

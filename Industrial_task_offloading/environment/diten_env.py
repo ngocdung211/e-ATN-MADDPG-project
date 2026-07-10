@@ -1,6 +1,6 @@
 """Digital twin environment for industrial task offloading."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -28,6 +28,7 @@ class DITENEnv:
         edge_estimation_error: float = 0.05,
         time_slots: int = 50,
         strict_connection_window: bool = True,
+        route_rectangles: Optional[Sequence[Sequence[Sequence[float]]]] = None,
     ):
         """Initialize the DITEN environment.
 
@@ -47,6 +48,7 @@ class DITENEnv:
             edge_estimation_error: Relative error for edge power estimation.
             time_slots: Number of time slots per episode.
             strict_connection_window: Enforce strict coverage window constraint.
+            route_rectangles: Optional custom rectangular mobility routes.
         """
         self.devices: List[IndustrialDevice] = devices
         self.servers: List[EdgeServer] = servers
@@ -87,6 +89,7 @@ class DITENEnv:
         self.server_estimated_power: Dict[int, float] = {}
         self.device_waypoints: Dict[int, List[np.ndarray]] = {}
         self.device_waypoint_idx: Dict[int, int] = {}
+        self.route_rectangles = route_rectangles
         self.world_min: np.ndarray = np.array([0.0, 0.0], dtype=float)
         self.world_max: np.ndarray = np.array([100.0, 100.0], dtype=float)
         self._build_predetermined_paths()
@@ -760,14 +763,23 @@ class DITENEnv:
         """Initialize fixed mobility paths for industrial devices."""
         if self.device_waypoints:
             return
-        # 5 fixed rectangular routes from user-confirmed Fig.4 topology (2 robots per route).
-        rectangles = [
-            [np.array([10.0, 10.0]), np.array([10.0, 30.0]), np.array([30.0, 30.0]), np.array([30.0, 10.0])],
-            [np.array([70.0, 10.0]), np.array([40.0, 10.0]), np.array([40.0, 20.0]), np.array([70.0, 20.0])],
-            [np.array([40.0, 20.0]), np.array([40.0, 50.0]), np.array([60.0, 50.0]), np.array([60.0, 20.0])],
-            [np.array([70.0, 10.0]), np.array([70.0, 40.0]), np.array([90.0, 40.0]), np.array([90.0, 10.0])],
-            [np.array([65.0, 45.0]), np.array([65.0, 55.0]), np.array([90.0, 55.0]), np.array([90.0, 45.0])],
-        ]
+        if self.route_rectangles is None:
+            # 5 fixed rectangular routes from user-confirmed Fig.4 topology.
+            rectangles = [
+                [np.array([10.0, 10.0]), np.array([10.0, 30.0]), np.array([30.0, 30.0]), np.array([30.0, 10.0])],
+                [np.array([70.0, 10.0]), np.array([40.0, 10.0]), np.array([40.0, 20.0]), np.array([70.0, 20.0])],
+                [np.array([40.0, 20.0]), np.array([40.0, 50.0]), np.array([60.0, 50.0]), np.array([60.0, 20.0])],
+                [np.array([70.0, 10.0]), np.array([70.0, 40.0]), np.array([90.0, 40.0]), np.array([90.0, 10.0])],
+                [np.array([65.0, 45.0]), np.array([65.0, 55.0]), np.array([90.0, 55.0]), np.array([90.0, 45.0])],
+            ]
+        else:
+            rectangles = [
+                [np.asarray(point, dtype=float) for point in rectangle]
+                for rectangle in self.route_rectangles
+            ]
+        route_count_needed = (len(self.devices) + 1) // 2
+        if len(rectangles) < route_count_needed:
+            raise ValueError("route_rectangles must provide one route per two devices")
         for device_index, device in enumerate(self.devices):
             route_index = device_index // 2
             route = [
