@@ -10,7 +10,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 from models.topology_gat import TopologyGATEncoder
-from ultils.topology_graph_state import TopologyGraphState
+from utils.topology_graph_state import TopologyGraphState
 
 
 class GraphGATActor(nn.Module):

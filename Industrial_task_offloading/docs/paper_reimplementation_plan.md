@@ -51,7 +51,7 @@ Goal: test whether the topology encoder helps more when it starts from useful to
 Assumption: pretraining should learn connection feasibility and topology quality from graph states before PPO begins. PPO then either freezes that encoder or fine-tunes it.
 
 1. [ ] **Define the Topology-GAT pretraining target**
-   - Input: `TopologyGraphState` from `ultils/topology_graph_state.py`.
+   - Input: `TopologyGraphState` from `utils/topology_graph_state.py`.
    - Encoder: `models/topology_gat.py::TopologyGATEncoder`.
    - Minimal supervised target:
      - per-device feasible server mask from edge feature `is_connected`;
@@ -62,7 +62,7 @@ Assumption: pretraining should learn connection feasibility and topology quality
 
 2. [ ] **Add topology pretraining dataset generation**
    - Goal: collect graph states from random or scripted rollouts without training MAPPO.
-   - Candidate file: `ultils/topology_gat_pretraining.py`.
+   - Candidate file: `utils/topology_gat_pretraining.py`.
    - Output:
      - train/validation graph samples;
      - feasible action mask targets;
@@ -126,8 +126,8 @@ Goal: test whether Graph-GAT Mask MAPPO only shows value when topology is comple
      - device route templates.
    - Verify:
      - old `paper_10d_3s` results are reproducible with the new config path.
-     - Scenario source: `ultils/topology_scenarios.py`.
-     - Preview source: `ultils/topology_scenario_preview.py`.
+     - Scenario source: `utils/topology_scenarios.py`.
+     - Preview source: `utils/topology_scenario_preview.py`.
      - Runner selection: `run_comparision.py --topology-scenario <name>`.
 
 2. [x] **Add topology complexity diagnostics**
@@ -283,12 +283,12 @@ What is now implemented:
 - [x] Paper-style delay fix: `environment/diten_env.py` now accumulates DAG makespan delay instead of summing overlapping branch subtask latencies.
 - [x] Efficient 100-episode comparison plotting: train learning models for 100 episodes, run fixed baselines for a short evaluation, and plot fixed baselines as mean-flat reference lines.
 - [x] Last training state JSONL: save one flat line per model beside the generated plot images for easy comparison.
-- [x] Experiment parameters are centralized in `ultils/paper_config.py` for the active comparison runner, including reward weights, penalties, estimation errors, GCN pretraining size, compute-power ranges, episode budgets, MAPPO settings, and Graph-GAT settings.
+- [x] Experiment parameters are centralized in `utils/paper_config.py` for the active comparison runner, including reward weights, penalties, estimation errors, GCN pretraining size, compute-power ranges, episode budgets, MAPPO settings, and Graph-GAT settings.
 - [x] `t_max` and `e_max` from `PAPER_PARAMS` are passed into GCN DAG sampling and per-episode task DAG generation in `run_comparision.py`.
-- [x] MAPPO and Graph-GAT MAPPO action masks can be turned on/off from `ultils/paper_config.py`.
+- [x] MAPPO and Graph-GAT MAPPO action masks can be turned on/off from `utils/paper_config.py`.
 - [x] Trainable model checkpoints are saved into the same plot folder as images and last-state JSONL for later evaluation without retraining.
-- [x] GPU readiness stage added without changing training logic: `ultils/gpu_readiness.py` reports PyTorch/CUDA/GPU status, and `docs/windows_gpu_readiness.md` documents the Windows RTX 4080 setup check.
-- [x] GAT task-priority extractor added as an option beside GCN: `models/task_priority_gat.py` implements `TaskPriorityGAT`, `priority_model` in `ultils/paper_config.py` selects `gcn` or `gat`, and GAT uses its own `models/checkpoints/gat_priority.pt`.
+- [x] GPU readiness stage added without changing training logic: `utils/gpu_readiness.py` reports PyTorch/CUDA/GPU status, and `docs/windows_gpu_readiness.md` documents the Windows RTX 4080 setup check.
+- [x] GAT task-priority extractor added as an option beside GCN: `models/task_priority_gat.py` implements `TaskPriorityGAT`, `priority_model` in `utils/paper_config.py` selects `gcn` or `gat`, and GAT uses its own `models/checkpoints/gat_priority.pt`.
 
 Current output should now look like:
 
@@ -415,7 +415,7 @@ Historical note: this queue recorded the earlier paper-reimplementation path. Us
 9. [x] **Add GPU readiness check without training rewiring**
    - Goal: Prepare for Windows RTX 4080 training while keeping the Mac demo stable.
    - Files touched:
-     - `ultils/gpu_readiness.py`
+     - `utils/gpu_readiness.py`
      - `docs/windows_gpu_readiness.md`
      - `tests/test_gpu_readiness.py`
    - Verify:
@@ -428,22 +428,22 @@ Historical note: this queue recorded the earlier paper-reimplementation path. Us
     - First target selected by user:
       - `Graph-GAT MAPPO`
     - Verify before/after code changes:
-      - `python -m ultils.gpu_readiness --preferred-device cuda` reports `CUDA available: True`.
+      - `python -m utils.gpu_readiness --preferred-device cuda` reports `CUDA available: True`.
       - GPU name shows the server GPU.
       - Mac CPU demo still remains the control path.
     - Status:
       - [x] `GraphGATMAPPOAgent` accepts a `device` setting and moves encoder/actor/critic modules to that torch device.
       - [x] Graph-GAT rollout update tensors are created on the agent device.
       - [x] Graph tensors remain built from CPU environment state, then move to the agent device at encode/mask boundaries.
-      - [x] `run_comparision.py` passes `graph_gat_device` from `ultils/paper_config.py` only to `Graph-GAT MAPPO`.
+      - [x] `run_comparision.py` passes `graph_gat_device` from `utils/paper_config.py` only to `Graph-GAT MAPPO`.
       - [ ] Run 1-3 Graph-GAT MAPPO smoke episodes on the Windows GPU server.
 
 11. [x] **Add GAT as task-priority option beside GCN**
     - Goal: Compare GCN priority extraction against a GAT priority extractor without removing the original GCN baseline.
     - Files touched:
       - `models/task_priority_gat.py`
-      - `ultils/experiment_setup.py`
-      - `ultils/gcn_training.py`
+      - `utils/experiment_setup.py`
+      - `utils/gcn_training.py`
       - `run_comparision.py`
       - `main.py`
       - `tests/test_task_priority_gat.py`
@@ -500,7 +500,7 @@ Historical note: this queue is preserved for traceability. Use the 2026-07-08 ac
 3. [x] **Implement minimal topology graph builder**
    - Goal: Convert existing flat joint state into graph tensors without touching env internals.
    - Candidate file:
-     - `ultils/topology_graph_state.py`
+     - `utils/topology_graph_state.py`
    - Rule:
      - read only the current `joint_state`, `num_devices`, and `num_servers`.
      - do not change `DITENEnv._get_joint_state`.

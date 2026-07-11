@@ -15,16 +15,16 @@ from environment.diten_env import DITENEnv
 from models.replay_buffer import MultiAgentReplayBuffer
 from models.maddpg import EpsilonATNMADDPGAgent
 from dataset.data_loader import KolektorSDDLoader
-from ultils.plotter import DITENPlotter
-from ultils.gcn_training import load_or_train_priority_model
-from ultils.experiment_setup import (
+from utils.plotter import DITENPlotter
+from utils.gcn_training import load_or_train_priority_model
+from utils.experiment_setup import (
     build_priorities,
     build_task_priority_model,
     generate_task_dags_for_episode,
     get_priority_checkpoint_path,
     make_gcn_dag_sampler,
 )
-from ultils.paper_config import PAPER_PARAMS
+from utils.paper_config import PAPER_PARAMS
 
 import random
 

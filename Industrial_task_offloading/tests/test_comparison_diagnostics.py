@@ -22,7 +22,7 @@ from run_comparision import (
     _summarize_step_metrics,
     build_algorithm_configs,
 )
-from ultils.paper_config import PAPER_PARAMS
+from utils.paper_config import PAPER_PARAMS
 
 
 def test_summarize_step_metrics_counts_penalties_and_times() -> None:

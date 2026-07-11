@@ -1,0 +1,570 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Graph Attention and DRL for Task Offloading in Industrial Image Recognition over Dynamic Digital Twin Edge Networks\\
+% \thanks{Identify applicable funding agency here. If none, delete this.}
+}
+
+\author{\IEEEauthorblockN{1\textsuperscript{st} Dung Do}
+\IEEEauthorblockA{\textit{Department of Computer Science and Engineering)} \\
+\textit{Yuan Ze University}\\
+Taoyuan, Taiwan \\
+\s1146085@mail.yzu.edu.tw}
+% \and
+% \IEEEauthorblockN{2\textsuperscript{nd} Given Name Surname}
+% \IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+% \textit{name of organization (of Aff.)}\\
+% City, Country \\
+% email address or ORCID}
+% \and
+% \IEEEauthorblockN{3\textsuperscript{rd} Given Name Surname}
+% \IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
+% \textit{name of organization (of Aff.)}\\
+% City, Country \\
+% email address or ORCID}
+% \and
+}
+
+% \author{
+% \IEEEauthorblockN{Lam Nguyen, Dung Do, and Naeem Ul Islam}
+% \IEEEauthorblockA{
+% \textit{Department of Computer Science and Engineering} \\
+% \textit{Yuan Ze University} \\
+% Taoyuan, Taiwan \\
+% \{s1146085, s1146086\}@mail.yzu.edu.tw, naeem@saturn.yzu.edu.tw}
+% }
+
+
+\maketitle
+
+\begin{abstract}
+Task offloading in Digital Twin Edge Networks (DITENs) has become a critical enabler for supporting delay-sensitive and computation-intensive industrial applications such as image recognition. Existing approaches, including GCN-enabled multi-agent deep reinforcement learning frameworks, have shown promising performance in modeling task dependencies and optimizing delay-energy trade-offs. However, these methods still have limitations in representing the varying importance of task dependencies and dynamic device-server connections in industrial environments. To address these challenges, this paper proposes a graph-attention-enhanced task offloading framework that integrates Graph Attention Networks (GATs) with reinforcement learning. Unlike conventional approaches that mainly rely on raw or uniformly aggregated graph representations, the proposed method leverages GAT to dynamically capture complex relationships among subtasks, industrial devices, and edge servers. Specifically, GAT is used to extract attention-aware representations from both the task dependency graph and the network topology graph, enabling a more expressive and adaptive state representation for offloading decision-making. In addition, a coverage-aware action masking mechanism is adopted to remove infeasible offloading actions and improve learning efficiency. Experimental evaluations demonstrate that the proposed approach achieves superior performance compared to existing methods, with improvements in system reward, reduced latency, and lower energy consumption. The proposed model also exhibits improved robustness in dynamic industrial edge environments.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Task Offloading, Digital Twin Edge Networks, Graph Attention Networks (GAT), Industrial Internet of Things (IIoT), Edge Computing, Deep Reinforcement Learning.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+With the rapid evolution of 6G communication and the Industrial Internet of Things (IIoT), industrial environments are increasingly relying on intelligent and delay-sensitive applications such as industrial image recognition, fault diagnosis, quality inspection, and predictive maintenance \cite{10892268}. These applications generate massive amounts of computation-intensive data that often exceed the processing capability of resource-constrained industrial devices. To address this challenge, Digital Twin Edge Networks (DITENs) have emerged as a promising paradigm by integrating digital twin technology with edge computing, enabling real-time monitoring, low-latency processing, and intelligent task offloading in industrial systems. In particular, task offloading plays a critical role in reducing computation delay and energy consumption by transferring complex tasks from industrial devices to nearby edge servers \cite{satyanarayanan2017emergence,wang2020convergence}.
+
+Employing 0/1 offloading or partial offloading to balance task processing delay and energy consumption, the existing optimization methods are primarily designed for independent tasks \cite{9663557,9530374,9174795}. However, with the evolution of industrial applications, tasks are increasingly composed of multiple subtasks exhibiting clear execution and data dependencies. Unlike independent-task offloading, dependent-task offloading must account for the sequential execution and data interactions among subtasks, significantly increasing the complexity of offloading. As shown in Fig. 1, to intuitively represent the dependencies between subtasks, the task is typically modeled as a directed acyclic graph (DAG). With this framework, the existing achievements have primarily focused on optimizing delay \cite{nguyen2023dependency}, energy consumption \cite{mehrabi2020energy}, or a combination of both \cite{xu2023energy}. Nevertheless, with the increasing number of subtasks, the complexity of dependent-task offloading is significantly intensified in dynamic environments, limiting the effectiveness and adaptability of existing solutions.
+
+Recently, several studies have explored dependent-task offloading in DITEN-enabled industrial environments. Existing approaches commonly model industrial image recognition tasks as DAGs \cite{10892268}, where subtasks exhibit strong execution and data dependencies. To capture these dependencies, Graph Convolutional Networks (GCNs) combined with Deep Reinforcement Learning (DRL) have been introduced for optimizing offloading decisions. Furthermore, multi-agent reinforcement learning frameworks such as MADDPG have demonstrated promising performance in balancing task delay and energy consumption under dynamic industrial scenarios. However, these approaches still face limitations when representing the varying importance of different task dependencies and dynamic device-server connections. In practical industrial environments, not all subtasks, dependency edges, and edge-server connections contribute equally to the offloading decision. Therefore, a more expressive graph representation is required to support efficient decision-making.
+
+The primary limitation of existing GCN-enabled DRL frameworks lies in their uniform neighborhood aggregation mechanism. Although GCNs are effective in extracting graph-structured information, they generally aggregate neighboring features according to the graph structure without explicitly distinguishing the relative importance of different neighbors. For dependent-task offloading, this may limit the representation of critical subtasks and dependency paths in the DAG. Similarly, in the network topology, different edge servers may have different levels of importance due to coverage availability, connection status, waiting delay, and computing resources. If these relationships are not sufficiently differentiated, the DRL agent may receive less informative state representations, leading to inefficient exploration and suboptimal offloading decisions.
+
+To overcome these challenges, this paper proposes a graph-attention-enhanced task offloading framework for industrial image recognition in DITENs. Unlike flat state approaches or uniformly aggregated graph representations, the proposed framework utilizes Graph Attention Networks (GATs) to dynamically learn the importance of relationships in both the task dependency graph and the network topology graph. Specifically, the task-level GAT is used to capture attention-aware dependencies among subtasks in the DAG, while the topology-level GAT is used to represent dynamic relationships between industrial devices and edge servers. By assigning different attention weights to different neighbors, the proposed method generates a richer and more adaptive state representation for reinforcement learning-based offloading.
+
+In addition, a coverage-aware action masking mechanism is adopted to improve the feasibility and efficiency of offloading decisions. Since mobile industrial devices may move in and out of the coverage areas of edge servers, not all edge servers are valid execution locations at every time slot. Therefore, the action mask removes edge servers that are outside the current coverage range from the action space before the agent selects an action. This mechanism reduces invalid exploration and helps the agent focus on feasible offloading choices, thereby improving learning efficiency and decision quality in dynamic industrial edge environments.
+
+The proposed framework is expected to achieve superior performance in terms of system reward, task processing delay, and energy consumption compared with existing GCN-enabled multi-agent DRL methods \cite{10892268}. By leveraging attention-based graph representation and coverage-aware action masking, the proposed model is designed to provide improved robustness and adaptability in industrial environments with mobile devices and dynamic network connections. Therefore, this work aims to provide an efficient and intelligent task offloading solution for next-generation industrial Digital Twin Edge Networks.
+
+The main contributions are summarized as follows.
+
+\begin{enumerate}
+\item With systematic models, the optimization problem of dependent-task offloading is formulated as minimizing the weighted sum of task processing delay and energy consumption of all industrial devices over a given period of time.
+
+\item By modeling the complex image recognition task as a DAG, a GAT-based task dependency representation method is proposed to learn the relative importance of subtasks and dependency edges, providing high-quality representations for offloading decisions.
+
+\item A topology-level GAT is designed to capture the dynamic relationships between industrial devices and edge servers, enabling the offloading agent to better represent device-server connectivity and edge network states.
+
+\item A coverage-aware action masking mechanism is adopted to reduce infeasible offloading actions. By removing edge servers outside the coverage range from the action space, the proposed method improves learning efficiency and supports more reliable offloading decisions.
+
+\end{enumerate}
+
+\section{Related Work}
+
+In dynamic industrial scenarios, task offloading has attracted significant attention due to the limited computing resources of industrial devices and the increasing complexity of IIoT applications. To improve service quality and reduce system cost, existing studies have investigated different offloading strategies for optimizing task processing delay, energy consumption, or their trade-off. For example, Lyapunov optimization, game-theoretic methods, heuristic algorithms, and reinforcement learning have been widely adopted to support computation offloading and resource allocation in mobile edge computing systems \cite{8371267}. These methods provide effective solutions for conventional offloading problems. However, most of them mainly focus on independent tasks, where each task is treated as a complete and indivisible unit. Such an assumption may not be suitable for complex industrial applications, where a task is usually composed of multiple subtasks with explicit execution orders and data dependencies.
+
+With the evolution of industrial applications, dependent-task offloading has become an important research direction. In industrial image recognition, a complete task can be divided into several subtasks, such as image extraction, denoising, standardization, feature extraction, and recognition. These subtasks are not independent, since the execution of one subtask may depend on the results generated by its predecessors. Therefore, dependent-task offloading must jointly consider subtask execution order, data transmission between subtasks, and the selection of execution locations \cite{10496897}. To represent such dependency relationships, a task is commonly modeled as a directed acyclic graph (DAG), where nodes denote subtasks and edges denote dependency relations. Based on DAG modeling, several studies have optimized task processing delay \cite{nguyen2023dependency}, energy consumption \cite{mehrabi2020energy}, or delay-energy trade-offs \cite{xu2023energy}. Nevertheless, as the number of subtasks and dependency relations increases, the offloading decision space becomes significantly larger, making it difficult for conventional optimization and heuristic methods to obtain efficient decisions in dynamic industrial environments.
+
+To address the complexity of dependent-task offloading, graph neural networks (GNNs) have been introduced to extract structural information from task DAGs. Since GNNs are effective in modeling graph-structured data, they can capture the dependency relationships among subtasks and provide informative representations for offloading decision-making. Several studies have combined GNNs with deep reinforcement learning (DRL) to optimize task scheduling and offloading in edge computing systems. For instance, GNN-based methods have been used to learn subtask features from DAGs, while DRL algorithms such as DDPG and multi-agent DRL have been employed to determine offloading decisions. In particular, Graph Convolutional Networks (GCNs) have been applied to generate execution priorities of dependent subtasks, thereby improving the quality of state representations for reinforcement learning agents \cite{10892268}. These studies demonstrate the potential of GNN-based methods for dependency-aware offloading. However, GCN-based representation mainly relies on neighborhood aggregation, which may not sufficiently distinguish the relative importance of different dependency edges and subtasks during decision-making.
+
+Digital twin (DT) technology has also been explored to improve task offloading in industrial edge environments \cite{10089851}. By constructing digital replicas of physical entities, such as industrial devices, tasks, and edge servers, DT can provide real-time monitoring and virtual-to-physical mapping for offloading decision support. In DT-assisted edge computing, the system can evaluate offloading strategies in the digital space before applying them to the physical environment, reducing the cost and risk of decision validation. Therefore, Digital Twin Edge Networks (DITENs), which integrate DT and edge computing, have become a promising paradigm for supporting low-latency and computation-intensive industrial applications. Existing DT-assisted offloading studies have considered resource allocation, task assignment, and intelligent decision-making in edge networks \cite{10680286,10062583}. However, the combination of DT, dependent-task offloading, and graph-based representation remains challenging due to the dynamic states of mobile industrial devices, changing network connections, and complex subtask dependencies.
+
+Recently, Liao et al. \cite{10892268} proposed a GCN-enabled task offloading framework for industrial image recognition in DITENs. Their work models image recognition tasks as DAGs, uses GCN to extract subtask dependency features and generate execution priorities, and designs an improved multi-agent DRL algorithm to optimize task processing delay and energy consumption in a multislot industrial scenario with mobile devices. This work provides a strong foundation for dependent-task offloading in DITEN-enabled IIoT environments. Nevertheless, its graph representation mainly depends on GCN-based neighborhood aggregation. Although GCN can capture graph structure, it does not explicitly assign different importance weights to different task dependencies or device-server connections. In practical industrial edge environments, not all subtasks, dependency edges, or edge-server connections contribute equally to the offloading decision. Moreover, due to device mobility, some edge servers may be outside the coverage range of an industrial device at a given time slot, making the corresponding offloading actions infeasible.
+
+Motivated by these limitations, this paper proposes a graph-attention-enhanced task offloading framework for industrial image recognition in DITENs. Different from existing GCN-enabled methods, the proposed framework uses Graph Attention Networks (GATs) to learn attention-aware representations from both the task dependency graph and the network topology graph. The task-level GAT captures the relative importance of subtasks and dependency edges in the DAG, while the topology-level GAT captures the dynamic relationships between industrial devices and edge servers. In addition, a coverage-aware action masking mechanism is introduced to remove infeasible offloading actions caused by coverage limitations. By integrating dual GAT-based representation and coverage-aware action masking, the proposed framework aims to improve learning efficiency and offloading decision quality in dynamic industrial edge environments.
+
+\section{System Model and Problem Formulation}
+
+In this section, we present the system model and problem formulation for dependent-task offloading in Digital Twin Edge Networks (DITENs). Following the DITEN-based industrial image recognition scenario in \cite{10892268}, we consider a multislot industrial environment with mobile industrial devices and edge servers. The system, task, mobility, digital twin, communication, and computation models are kept consistent with the baseline formulation. The proposed GAT-based representation and coverage-aware action masking mechanism will be introduced in the solution section.
+
+\subsection{System Overview}
+
+We consider a DITEN-enabled IIoT system with a set of mobile industrial devices denoted by
+\begin{equation}
+\mathcal{D}=\{d_1,d_2,\ldots,d_D\},
+\end{equation}
+and a set of edge servers denoted by
+\begin{equation}
+\mathcal{S}=\{s_1,s_2,\ldots,s_S\}.
+\end{equation}
+The system operates over a finite set of time slots
+\begin{equation}
+\mathcal{T}=\{1,2,\ldots,T\}.
+\end{equation}
+At each time slot $t$, each industrial device $d_i$ may generate an industrial image recognition task $q_i^t$. The edge servers are deployed at fixed locations and provide computation resources for nearby industrial devices. The location of edge server $s_j$ is denoted by
+\begin{equation}
+L_j^s=[x_j^s,y_j^s]^T,
+\end{equation}
+while the location of device $d_i$ at time slot $t$ is denoted by
+\begin{equation}
+L_i^t=[x_i^t,y_i^t]^T.
+\end{equation}
+
+\subsection{Task Dependency Model}
+
+Industrial image recognition is usually composed of multiple dependent subtasks, such as image extraction, denoising, standardization, feature extraction, and recognition. Therefore, the task generated by device $d_i$ at time slot $t$ is modeled as a directed acyclic graph (DAG), defined as
+\begin{equation}
+q_i^t=(\mathcal{V}_i^t,\mathcal{E}_i^t),
+\end{equation}
+where
+\begin{equation}
+\mathcal{V}_i^t=\{v_{i,1}^t,v_{i,2}^t,\ldots,v_{i,M}^t\}
+\end{equation}
+is the set of $M$ subtasks, and $\mathcal{E}_i^t$ is the set of dependency edges among subtasks. If there is an edge $(v_{i,k}^t,v_{i,m}^t)\in \mathcal{E}_i^t$, subtask $v_{i,m}^t$ can only start after its predecessor $v_{i,k}^t$ has been completed and the required intermediate result has been delivered.
+
+Each subtask $v_{i,m}^t$ is characterized by
+\begin{equation}
+\chi_{i,m}^t=\{C_{i,m}^t,D_{i,m}^t,R_{i,m}^t\},
+\end{equation}
+where $C_{i,m}^t$ denotes the required CPU cycles, $D_{i,m}^t$ denotes the input data size, and $R_{i,m}^t$ denotes the output result size. The predecessor set of subtask $v_{i,m}^t$ is denoted by
+\begin{equation}
+\mathrm{pred}(v_{i,m}^t)
+=
+\{v_{i,k}^t \mid (v_{i,k}^t,v_{i,m}^t)\in \mathcal{E}_i^t\}.
+\end{equation}
+
+For each subtask $v_{i,m}^t$, the offloading decision is denoted by
+\begin{equation}
+o_{i,m}^t \in \{0,1,\ldots,S\},
+\end{equation}
+where $o_{i,m}^t=0$ means that subtask $v_{i,m}^t$ is executed locally on device $d_i$, and $o_{i,m}^t=j$ means that subtask $v_{i,m}^t$ is offloaded to edge server $s_j$. For convenience, an entry subtask $v_{i,0}^t$ and an exit subtask $v_{i,M+1}^t$ are introduced in the DAG. These two virtual subtasks have no actual data volume and are executed locally. They are used to represent the start and completion of the whole task.
+
+\subsection{Mobility Model}
+
+Since industrial devices may move along predefined routes, their connectivity with edge servers changes over time. Following \cite{10892268}, the movement of each device is modeled in a slotted manner. In time slot $t$, the position of device $d_i$ is denoted by $L_i^t$. Each edge server $s_j$ has a fixed signal coverage range.
+
+If device $d_i$ connects to edge server $s_j$ during time slot $t$, the start moment and end moment of the connection are denoted by $l_{i,j}^{t,start}$ and $l_{i,j}^{t,end}$, respectively. Therefore, if subtask $v_{i,m}^t$ is offloaded to edge server $s_j$, its edge execution must start after the connection is established and must finish before the connection is lost. These connection-window constraints are expressed as
+\begin{equation}
+ST_{i,m}^{t,edge}(j)>l_{i,j}^{t,start},
+\quad \text{if } o_{i,m}^t=j,
+\end{equation}
+and
+\begin{equation}
+FIN_{i,m}^{t,edge}(j)<l_{i,j}^{t,end},
+\quad \text{if } o_{i,m}^t=j.
+\end{equation}
+These constraints ensure that an offloaded subtask can be completed within the available communication window between the device and the selected edge server.
+\subsection{DT model}
+
+In the considered DITEN architecture, the digital twin layer maintains virtual representations of industrial devices, tasks, and edge servers. The digital twin of device $d_i$ at time slot $t$ is represented as
+\begin{equation}
+\mathrm{DT}_{d_i}^{t}
+=
+\{q_i^t,L_i^t,\hat{f}_i^{loc},W_i^t\},
+\end{equation}
+where $q_i^t$ is the generated task, $L_i^t$ is the device location, $\hat{f}i^{loc}$ is the estimated local computing capability, and $W_i^t$ is the local waiting delay. Similarly, the digital twin of edge server $s_j$ is defined as
+\begin{equation}
+\mathrm{DT}_{s_j}^{t}
+=
+\{L_j^{s},\hat{f}_j^{edge},W_j^t\},
+\end{equation}
+where $\hat{f}_j^{edge}$ is the estimated computing capability of $s_j$, and $W_j^t$ is the waiting delay of the edge server. Compared with the original DT model in \cite{10892268}, the state deviation terms are not explicitly expanded here, because this paper focuses on improving the graph-based state representation and offloading decision process.
+\subsection{Communication and Computation Model}
+
+When subtask $v_{i,m}^t$ is offloaded to edge server $s_j$, the input data and intermediate results may need to be transmitted between device $d_i$ and edge server $s_j$. The uplink transmission rate from device $d_i$ to edge server $s_j$ at time slot $t$ is defined as
+\begin{equation}
+r_{i,j}^{t,up}=B\log_2\left(1+\frac{p_i \cdot g_{i,j}^t}{N_0}\right),
+\end{equation}
+where $B$ is the channel bandwidth, $p_i$ is the transmission power of device $d_i$, $g_{i,j}^t$ is the channel gain between $d_i$ and $s_j$, and $N_0$ is the noise power. Similarly, the downlink transmission rate from edge server $s_j$ to device $d_i$ is given by
+\begin{equation}
+r_{i,j}^{t,down}=B\log_2\left(1+\frac{P_j \cdot g_{i,j}^t}{N_0}\right),
+\end{equation}
+where $P_j$ is the transmission power of edge server $s_j$. Here, $g_{i,j}^t$ denotes the channel gain of the wireless link between $d_i$ and $s_j$. If uplink and downlink channels are modeled separately, $g_{i,j}^t$ can be replaced by $g_{i,j}^{t,up}$ and $g_{j,i}^{t,down}$, respectively.
+
+If subtask $v_{i,m}^t$ is executed locally on device $d_i$, its local execution delay is calculated as
+\begin{equation}
+T_{i,m}^{t,loc}=\frac{C_{i,m}^t}{\hat{f}_i^{loc}}+W_i^t,
+\end{equation}
+and the corresponding local energy consumption is
+\begin{equation}
+E_{i,m}^{t,loc}=\kappa_i C_{i,m}^t(\hat{f}_i^{loc})^2,
+\end{equation}
+where $\kappa_i$ is the effective switched capacitance coefficient of device $d_i$.
+
+If subtask $v_{i,m}^t$ is offloaded to edge server $s_j$, the uplink transmission delay is
+\begin{equation}
+T_{i,m,j}^{t,up}=\frac{D_{i,m}^t}{r_{i,j}^{t,up}},
+\end{equation}
+and the edge execution delay is
+\begin{equation}
+T_{i,m,j}^{t,exe}=\frac{C_{i,m}^t}{\hat{f}_j^{edge}}+W_j^t.
+\end{equation}
+If the result needs to be returned to device $d_i$, the downlink transmission delay is
+\begin{equation}
+T_{i,m,j}^{t,down}=\frac{R_{i,m}^t}{r_{i,j}^{t,down}}.
+\end{equation}
+Therefore, the total edge execution delay can be expressed as
+\begin{equation}
+T_{i,m}^{t,edge}(j)=T_{i,m,j}^{t,up}+T_{i,m,j}^{t,exe}+T_{i,m,j}^{t,down}.
+\end{equation}
+The corresponding energy consumption is given by
+\begin{equation}
+E_{i,m}^{t,edge}(j)=p_iT_{i,m,j}^{t,up}+\kappa_j C_{i,m}^t(\hat{f}_j^{edge})^2+P_jT_{i,m,j}^{t,down},
+\end{equation}
+where $\kappa_j$ is the energy coefficient of edge server $s_j$.
+
+Considering the dependency among subtasks, the start time of each subtask must be later than the completion time of all its predecessor subtasks. Let $ST_{i,m}^t$ and $FIN_{i,m}^t$ denote the start time and finish time of subtask $v_{i,m}^t$, respectively. Then,
+\begin{equation}
+ST_{i,m}^t \geq FIN_{i,k}^t + \Delta_{k,m}^t,
+\quad \forall v_{i,k}^t \in \mathrm{pred}(v_{i,m}^t),
+\end{equation}
+where $\Delta_{k,m}^t$ denotes the transmission delay of the intermediate result between subtasks $v_{i,k}^t$ and $v_{i,m}^t$, depending on their execution locations. The finish time is computed as
+
+\begin{equation}
+\label{eq:finish_time}
+FIN_{i,m}^t =
+\begin{cases}
+ST_{i,m}^t + T_{i,m}^{t,loc}, & o_{i,m}^t=0,\\
+ST_{i,m}^t + T_{i,m}^{t,edge}(j), & o_{i,m}^t=j.
+\end{cases}
+\end{equation}
+
+The total task processing delay of $q_i^t$ is defined as
+\begin{equation}
+T_i^t
+=
+FIN_{i,M+1}^t
+-
+FIN_{i,0}^t,
+\end{equation}
+and the total energy consumption is defined as
+\begin{equation}
+E_i^t=\sum_{m=1}^{M} E_{i,m}^t,
+\end{equation}
+where
+\begin{equation}
+E_{i,m}^t =
+\begin{cases}
+E_{i,m}^{t,loc}, & o_{i,m}^t=0,\\
+E_{i,m}^{t,edge}(j), & o_{i,m}^t=j.
+\end{cases}
+\end{equation}
+
+\subsection{Problem Formulation}
+
+Based on the above models, the objective is to determine the execution order and offloading decisions of all subtasks generated by all industrial devices over multiple time slots. The optimization goal is to minimize the weighted sum of task processing delay and energy consumption. Therefore, the dependent-task offloading problem is formulated as
+\begin{equation}
+\begin{aligned}
+\mathbf{P1}: \quad
+\min_{\{R_{d_i}^t,B_i^t,O_i^t\}} \quad
+&
+\sum_{t=1}^{T}
+\sum_{i=1}^{D}
+\left(
+\lambda_d T_i^t
++
+\lambda_e E_i^t
+\right) \\
+\mathrm{s.t.} \quad
+&
+ST_{i,m}^{t,edge}(j)
+>
+l_{i,j}^{t,start},
+\quad
+\text{if } o_{i,m}^t=j, \\
+&
+FIN_{i,m}^{t,edge}(j)
+<
+l_{i,j}^{t,end},
+\quad
+\text{if } o_{i,m}^t=j, \\
+&
+T_i^t\leq T_{\max},
+\quad \forall i,t, \\
+&
+b_{i,m}^t\in\{0,1\},
+\quad \forall i,m,t, \\
+&
+o_{i,m}^t\in\{0,1,\ldots,S\},
+\quad \forall i,m,t, \\
+&
+E_i^t\leq E_{\max},
+\quad \forall i,t.
+\end{aligned}
+\end{equation}
+Here, $R_{d_i}^t$ denotes the execution order of subtasks of device $d_i$ in time slot $t$, $B_i^t$ denotes the binary offloading decisions, and $O_i^t$ denotes the selected execution locations. $\lambda_d$ and $\lambda_e$ are the weighting factors for task processing delay and energy consumption, respectively. $T_{\max}$ is the maximum tolerable delay, and $E_{\max}$ is the maximum acceptable energy consumption.
+
+\section{Proposed GAT-Enhanced Offloading Framework}
+
+In this section, we present the proposed GAT-enhanced task offloading framework for industrial image recognition in DITENs. Based on the system model and problem formulation in Section III, the proposed framework aims to improve the quality of state representation and reduce infeasible action exploration. Specifically, two Graph Attention Network (GAT) modules are introduced to extract attention-aware features from both the task dependency graph and the network topology graph. In addition, a coverage-aware action masking mechanism is adopted to remove infeasible offloading actions before action selection.
+
+\subsection{Overview of the Proposed Framework}
+
+The proposed framework consists of four main components. First, for each industrial image recognition task $q_i^t$, the task dependency graph is constructed according to its DAG structure. The task-level GAT is then used to learn attention-aware subtask representations by assigning different importance weights to different dependency relations. Second, a network topology graph is constructed to describe the dynamic relationships between industrial devices and edge servers. The topology-level GAT is used to extract device-server connectivity features from the current network state. Third, the task-level and topology-level representations are combined with the digital twin states to form the state input of the reinforcement learning agent. Finally, before the agent selects an offloading action, a coverage-aware action mask is applied to remove edge servers that are not feasible for the current device.
+
+Different from GCN-based methods that mainly aggregate neighboring features according to graph structure, the proposed GAT-based framework learns the relative importance of neighboring nodes through an attention mechanism. Therefore, it can provide more informative state representations for task offloading decisions.
+
+\subsection{Task-Level GAT for Dependency Representation}
+
+For each task $q_i^t=(\mathcal{V}_i^t,\mathcal{E}_i^t)$, the DAG is used as the task dependency graph. Each node represents a subtask $v_{i,m}^t$, and each directed edge represents a dependency relation between two subtasks. The initial feature vector of subtask $v_{i,m}^t$ is defined as
+\begin{equation}
+x_{i,m}^{t,task}
+=
+[C_{i,m}^t,D_{i,m}^t,R_{i,m}^t],
+\end{equation}
+where $C_{i,m}^t$, $D_{i,m}^t$, and $R_{i,m}^t$ denote the required CPU cycles, input data size, and result data size of subtask $v_{i,m}^t$, respectively.
+
+Given the initial node feature $x_{i,m}^{t,task}$, the task-level GAT first applies a linear transformation:
+\begin{equation}
+z_{i,m}^{t,task}
+=
+W_{task}x_{i,m}^{t,task},
+\end{equation}
+where $W_{task}$ is a trainable weight matrix. For a neighboring subtask $v_{i,k}^t\in\mathcal{N}_{i,m}^{task}$, the attention coefficient between $v_{i,m}^t$ and $v_{i,k}^t$ is calculated as
+\begin{equation}
+e_{m,k}^{t,task}
+=
+\mathrm{LeakyReLU}
+\left(
+a_{task}^{T}
+[z_{i,m}^{t,task} \Vert z_{i,k}^{t,task}]
+\right),
+\end{equation}
+where $a_{task}$ is a trainable attention vector, and $\Vert$ denotes vector concatenation. The normalized attention weight is then computed by
+\begin{equation}
+\alpha_{m,k}^{t,task}
+=
+\frac{
+\exp(e_{m,k}^{t,task})
+}{
+\sum_{v_{i,r}^t\in\mathcal{N}_{i,m}^{task}}
+\exp(e_{m,r}^{t,task})
+}.
+\end{equation}
+The task-level embedding of subtask $v_{i,m}^t$ is obtained as
+\begin{equation}
+h_{i,m}^{t,task}
+=
+\sigma
+\left(
+\sum_{v_{i,k}^t\in\mathcal{N}_{i,m}^{task}}
+\alpha_{m,k}^{t,task}
+z_{i,k}^{t,task}
+\right),
+\end{equation}
+where $\sigma(\cdot)$ is a nonlinear activation function.
+
+Through this attention mechanism, the task-level GAT can distinguish the relative importance of different dependency relations in the DAG. As a result, critical subtasks and dependency paths can be assigned larger attention weights, providing more informative representations for offloading decision-making.
+
+\subsection{Topology-Level GAT for Network Representation}
+
+In addition to task dependencies, the offloading decision is also affected by the dynamic network topology between industrial devices and edge servers. Therefore, a topology graph $\mathcal{G}_{topo}^t=(\mathcal{U}^t,\mathcal{E}_{topo}^t)$ is constructed at each time slot $t$, where
+\begin{equation}
+\mathcal{U}^t=\mathcal{D}\cup\mathcal{S}
+\end{equation}
+is the set of device and edge-server nodes, and $\mathcal{E}_{topo}^t$ represents the available device-server connections.
+
+For device node $d_i$, the initial topology feature can be defined as
+\begin{equation}
+x_{d_i}^{t,topo}
+=
+[L_i^t,\hat{f}_i^{loc},W_i^t],
+\end{equation}
+where $L_i^t$ is the location of device $d_i$, $\hat{f}_i^{loc}$ is the estimated local computing capability, and $W_i^t$ is the local waiting delay. For edge server $s_j$, the initial topology feature is defined as
+\begin{equation}
+x_{s_j}^{t,topo}
+=
+[L_j^s,\hat{f}_j^{edge},W_j^t],
+\end{equation}
+where $L_j^s$ is the location of edge server $s_j$, $\hat{f}_j^{edge}$ is the estimated edge computing capability, and $W_j^t$ is the waiting delay of edge server $s_j$.
+
+Similar to the task-level GAT, the topology-level GAT computes the attention coefficient between connected nodes. For device node $d_i$ and edge server node $s_j$, the attention coefficient is given by
+\begin{equation}
+e_{i,j}^{t,topo}
+=
+\mathrm{LeakyReLU}
+\left(
+a_{topo}^{T}
+[W_{topo}x_{d_i}^{t,topo}
+\Vert
+W_{topo}x_{s_j}^{t,topo}]
+\right),
+\end{equation}
+where $W_{topo}$ and $a_{topo}$ are trainable parameters. The normalized attention weight is computed as
+\begin{equation}
+\alpha_{i,j}^{t,topo}
+=
+\frac{
+\exp(e_{i,j}^{t,topo})
+}{
+\sum_{s_r\in\mathcal{N}_{i}^{topo}}
+\exp(e_{i,r}^{t,topo})
+},
+\end{equation}
+where $\mathcal{N}_{i}^{topo}$ denotes the set of edge servers connected to device $d_i$ at time slot $t$.
+
+The topology-level representation of device $d_i$ is then calculated as
+\begin{equation}
+h_i^{t,topo}
+=
+\sigma
+\left(
+\sum_{s_j\in\mathcal{N}_{i}^{topo}}
+\alpha_{i,j}^{t,topo}
+W_{topo}x_{s_j}^{t,topo}
+\right).
+\end{equation}
+This representation allows the agent to identify which edge servers are more important or more suitable under the current network state.
+
+\subsection{MDP Formulation}
+
+The dependent-task offloading problem is formulated as a Markov Decision Process (MDP). Each industrial device $d_i$ is regarded as an agent. At each time slot $t$, the agent sequentially determines the execution location of each subtask $v_{i,m}^t$.
+
+\subsubsection{State Space}
+
+Different from raw-state-based methods, the proposed framework uses the GAT-enhanced representation as part of the state. When device $d_i$ makes an offloading decision for subtask $v_{i,m}^t$, the state is defined as
+\begin{equation}
+s_{i,m}^t
+=
+[h_{i,m}^{t,task}
+\Vert
+h_i^{t,topo}
+\Vert
+z_{i,m}^t],
+\end{equation}
+where $h_{i,m}^{t,task}$ is the task-level GAT embedding of subtask $v_{i,m}^t$, $h_i^{t,topo}$ is the topology-level GAT embedding of device $d_i$, and $z_{i,m}^t$ denotes other scalar state information, such as local computing capability, edge computing capability, waiting delays, and connection-window information.
+
+\subsubsection{Action Space}
+
+The action of agent $d_i$ for subtask $v_{i,m}^t$ is the offloading decision:
+\begin{equation}
+a_{i,m}^t=o_{i,m}^t.
+\end{equation}
+Therefore, the original action space is
+\begin{equation}
+\mathcal{A}_{i,m}^t=\{0,1,\ldots,S\},
+\end{equation}
+where action $0$ means local execution, and action $j$ means offloading the subtask to edge server $s_j$.
+
+\subsubsection{Reward Function}
+
+The reward is designed to guide the agent toward low-delay and low-energy offloading decisions. Following the delay-energy optimization objective, the immediate reward for executing subtask $v_{i,m}^t$ is defined as
+\begin{equation}
+\begin{aligned}
+r_{i,m}^t
+=
+&
+\lambda_1
+\left(
+\frac{T_{\max}}{M}
+-
+T_{i,m}^t
+\right)
++
+\lambda_2
+\left(
+T_{\max}
+-
+T_{i,accm}^t
+\right) \\
+&
++
+\lambda_3
+\left(
+\frac{E_{\max}}{M}
+-
+E_{i,m}^t
+\right)
++
+\lambda_4
+\left(
+E_{\max}
+-
+E_{i,accm}^t
+\right) \\
+&
++
+\lambda_5 p_{out},
+\end{aligned}
+\end{equation}
+where $T_{i,m}^t$ and $E_{i,m}^t$ are the delay and energy consumption of subtask $v_{i,m}^t$, respectively. $T_{i,accm}^t$ and $E_{i,accm}^t$ denote the accumulated delay and energy consumption of the executed subtasks. $p_{out}$ is the penalty for violating the available connection window, and $\lambda_1$, $\lambda_2$, $\lambda_3$, $\lambda_4$, and $\lambda_5$ are reward weights.
+
+\subsection{Coverage-Aware Action Masking}
+
+In dynamic industrial environments, not all edge servers are feasible offloading destinations at every time slot. Due to the mobility of industrial devices, some edge servers may be outside the coverage range or unavailable for the current device. If the agent explores these infeasible actions, the training process becomes inefficient and the learned policy may be unstable.
+
+To address this issue, a coverage-aware action masking mechanism is introduced. Let $c_{i,j}^t$ denote whether edge server $s_j$ is available for device $d_i$ at time slot $t$:
+\begin{equation}
+c_{i,j}^t =
+\begin{cases}
+1, & \text{if } s_j \text{ is available for } d_i \text{ at time slot } t,\
+0, & \text{otherwise}.
+\end{cases}
+\end{equation}
+Based on $c_{i,j}^t$, the valid action set is defined as
+\begin{equation}
+\mathcal{A}_{i,m}^{t,valid}
+=
+{0}
+\cup
+{j \mid c_{i,j}^t=1,\ j\in{1,\ldots,S}}.
+\end{equation}
+The local execution action is always retained in the valid action set, while edge servers that are unavailable are removed.
+
+Before action selection, the policy output is masked as
+\begin{equation}
+\tilde{\pi}_{i,m}^t(a)
+=
+\begin{cases}
+\pi_{i,m}^t(a), & \text{if } a\in\mathcal{A}_{i,m}^{t,valid},\
+0, & \text{otherwise}.
+\end{cases}
+\end{equation}
+The masked policy is then normalized before sampling or selecting the final action:
+\begin{equation}
+\bar{\pi}_{i,m}^t(a)
+=
+\frac{
+\tilde{\pi}_{i,m}^t(a)
+}{
+\sum_{a'\in\mathcal{A}_{i,m}^{t,valid}}
+\tilde{\pi}_{i,m}^t(a')
+}.
+\end{equation}
+The final action is selected from the masked valid action space:
+\begin{equation}
+a_{i,m}^t
+\sim
+\bar{\pi}_{i,m}^t(a).
+\end{equation}
+
+The action mask does not change the original optimization objective. Instead, it reduces invalid exploration by preventing the agent from selecting physically infeasible edge servers. As a result, the agent can focus on feasible offloading actions, which improves training efficiency and decision quality.
+
+\subsection{Training Procedure}
+
+The overall training process is summarized as follows. At the beginning of each episode, the states of industrial devices, edge servers, and tasks are initialized. At each time slot $t$, each device $d_i$ generates a DAG-based image recognition task $q_i^t$. The task-level GAT extracts subtask dependency embeddings from the task DAG, while the topology-level GAT extracts device-server topology embeddings from the current network state. For each subtask $v_{i,m}^t$, the agent constructs the GAT-enhanced state $s_{i,m}^t$, applies the coverage-aware action mask, and selects a feasible offloading action $a_{i,m}^t$. After executing the action, the environment returns the delay, energy consumption, reward, and next state. The transition is stored in the replay buffer and used to update the actor and critic networks.
+
+The proposed training procedure enables the agent to learn offloading policies from both task dependency information and dynamic topology information. By combining attention-aware graph representation with coverage-aware action masking, the proposed framework improves the ability of the agent to make efficient and feasible offloading decisions in dynamic industrial edge environments.
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+
+\end{document}

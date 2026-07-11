@@ -29,23 +29,23 @@ from environment.diten_env import DITENEnv
 from dataset.data_loader import KolektorSDDLoader
 from models.replay_buffer import MultiAgentReplayBuffer
 from models.maddpg import EpsilonATNMADDPGAgent
-from ultils.comparison_outputs import (
+from utils.comparison_outputs import (
     build_last_training_state_line,
     build_model_checkpoint,
     flatten_topology_metrics,
     save_comparison_outputs,
 )
-from ultils.gcn_training import load_or_train_priority_model
-from ultils.experiment_setup import (
+from utils.gcn_training import load_or_train_priority_model
+from utils.experiment_setup import (
     build_priorities,
     build_task_priority_model,
     generate_task_dags_for_episode,
     get_priority_checkpoint_path,
     make_gcn_dag_sampler,
 )
-from ultils.paper_config import PAPER_PARAMS
-from ultils.topology_graph_state import TopologyGraphState, build_topology_graph_state
-from ultils.topology_scenarios import (
+from utils.paper_config import PAPER_PARAMS
+from utils.topology_graph_state import TopologyGraphState, build_topology_graph_state
+from utils.topology_scenarios import (
     TopologyScenario,
     available_topology_scenario_names,
     compute_topology_metrics,

@@ -15,7 +15,7 @@ import numpy as np
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from ultils.topology_scenarios import (
+from utils.topology_scenarios import (
     TopologyScenario,
     build_topology_scenarios,
     compute_topology_metrics,
@@ -286,7 +286,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join("Result_plot", "topology_preview"),
+        default=os.path.join("archive", "topology_preview"),
         help="Directory for generated PNG and JSON files.",
     )
     args = parser.parse_args()

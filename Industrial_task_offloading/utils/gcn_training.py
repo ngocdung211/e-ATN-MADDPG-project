@@ -157,7 +157,7 @@ def load_or_train_priority_model(
         epoch_loss = 0.0
         for _ in range(samples_per_epoch):
             task_dag = dag_sampler()
-            from ultils.graph_ultils import extract_gcn_inputs
+            from utils.graph_utils import extract_gcn_inputs
 
             features, adjacency = extract_gcn_inputs(task_dag)
             y = build_priority_targets(task_dag)
