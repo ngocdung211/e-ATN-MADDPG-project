@@ -675,48 +675,6 @@ class DITENEnv:
         upload_delay = data_size / up_rate
         return upload_delay, device.transmit_power * upload_delay
 
-    def _schedule_subtask_execution(
-        self, device: IndustrialDevice, subtask: Subtask, action: int, predecessor_ready_time: float
-    ) -> Tuple[float, float, float, float, float, float]:
-        """Schedule a subtask on local or edge resources.
-
-        Args:
-            device: Device executing the subtask.
-            subtask: Subtask metadata.
-            action: Execution location (0 local, >0 edge).
-            predecessor_ready_time: Earliest time allowed by dependencies.
-
-        Returns:
-            Tuple of (start_time, finish_time, f_est, f_actual, comp_energy, p_out).
-        """
-        if action == 0:
-            f_est = self.device_estimated_power[device.id]
-            f_actual = device.compute_power
-            t_comp, e_comp = self.network_env.calculate_local_computation(
-                subtask.cpu_cycles, device.energy_coeff, f_est, f_actual
-            )
-            local_wait = self._compute_waiting_delay_local(device)
-            start_time = max(self.current_slot + local_wait, predecessor_ready_time)
-            finish_time = start_time + t_comp
-            self.local_finish_time[device.id] = finish_time
-            return start_time, finish_time, f_est, f_actual, e_comp, 0.0
-
-        server = self.servers[action - 1]
-        f_est = self.server_estimated_power[server.id]
-        f_actual = server.compute_power
-        t_comp, e_comp = self.network_env.calculate_edge_computation(
-            subtask.cpu_cycles, server.energy_coeff, f_est, f_actual
-        )
-        #
-        # e_comp = 0
-        server_wait = self._compute_waiting_delay_server(server)
-        l_start, l_end = self.connection_windows[(device.id, server.id)]
-        start_time = max(self.current_slot + server_wait, predecessor_ready_time, l_start + 1e-9)
-        finish_time = start_time + t_comp
-        p_out = self.p_out_value if not (start_time > l_start and finish_time < l_end) else 0.0
-        self.server_finish_time[server.id] = finish_time
-        return start_time, finish_time, f_est, f_actual, e_comp, p_out
-
     def get_state_dim(self) -> int:
         """Return the flattened state vector dimension.
 

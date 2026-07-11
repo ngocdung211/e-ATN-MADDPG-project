@@ -15,7 +15,7 @@ import numpy as np
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.topology_scenarios import (
+from utils.topology_scenarios_config import (
     TopologyScenario,
     build_topology_scenarios,
     compute_topology_metrics,
@@ -81,42 +81,6 @@ def _draw_direction_arrow(
         va="center",
         zorder=7,
     )
-
-
-def _sample_route_points(
-    routes: Sequence[Sequence[Sequence[float]]], samples_per_segment: int = 12
-) -> np.ndarray:
-    """Sample points along every route edge."""
-    points = []
-    for route in routes:
-        route_array = _route_to_array(route)
-        for start, end in zip(route_array[:-1], route_array[1:]):
-            for sample_index in range(samples_per_segment):
-                ratio = sample_index / float(samples_per_segment)
-                points.append(start + ratio * (end - start))
-    return np.asarray(points, dtype=float)
-
-
-def _connection_counts(
-    points: np.ndarray, server_locations: np.ndarray, coverage_radius: float
-) -> np.ndarray:
-    """Count how many servers cover each point."""
-    deltas = points[:, np.newaxis, :] - server_locations[np.newaxis, :, :]
-    distances = np.linalg.norm(deltas, axis=2)
-    return np.sum(distances <= coverage_radius, axis=1)
-
-
-def _summarize_counts(
-    counts: np.ndarray, device_count: int, server_count: int
-) -> Dict[str, float]:
-    """Build topology metrics from per-point feasible-server counts."""
-    return {
-        "avg_feasible_servers": float(np.mean(counts)),
-        "density": float(np.mean(counts) / max(server_count, 1)),
-        "zero_link_ratio": float(np.mean(counts == 0)),
-        "multi_link_ratio": float(np.mean(counts >= 2)),
-        "device_server_ratio": float(device_count / max(server_count, 1)),
-    }
 
 
 def compute_scenario_metrics(scenario: TopologyScenario) -> Dict[str, object]:
@@ -286,7 +250,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join("archive", "topology_preview"),
+        default=os.path.join("results", "topology_preview"),
         help="Directory for generated PNG and JSON files.",
     )
     args = parser.parse_args()

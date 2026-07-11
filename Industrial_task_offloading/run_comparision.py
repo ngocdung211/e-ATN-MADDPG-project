@@ -45,7 +45,7 @@ from utils.experiment_setup import (
 )
 from utils.paper_config import PAPER_PARAMS
 from utils.topology_graph_state import TopologyGraphState, build_topology_graph_state
-from utils.topology_scenarios import (
+from utils.topology_scenarios_config import (
     TopologyScenario,
     available_topology_scenario_names,
     compute_topology_metrics,
@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override baseline_evaluation_episodes.",
+    )
+    parser.add_argument(
+        "--note",
+        default="",
+        help="Short experiment note stored in outputs and appended to the output folder.",
     )
     return parser.parse_args()
 
@@ -497,7 +502,11 @@ def _format_diagnostic_summary(algo_name: str, episode_number: int, history: Dic
 
 def _should_print_diagnostics(episode_number: int, num_episodes: int) -> bool:
     """Return whether to print readable diagnostics for this episode."""
-    return episode_number == num_episodes or episode_number % 500 == 0
+    provisional = PAPER_PARAMS["provisional_table2_needed"]
+    interval = int(provisional["diagnostic_interval_episodes"])
+    return episode_number == num_episodes or (
+        interval > 0 and episode_number % interval == 0
+    )
 
 
 def _update_agents_from_buffer(
@@ -617,6 +626,7 @@ def train_algorithm(
     priority_mode: str = "gcn",
     topology_scenario: Optional[TopologyScenario] = None,
     topology_metrics: Optional[Dict[str, object]] = None,
+    experiment_note: str = "",
 ) -> Tuple[Dict[str, List[float]], Optional[Dict[str, Any]]]:
     """Train one algorithm configuration and return metrics and checkpoint.
 
@@ -632,14 +642,16 @@ def train_algorithm(
         priority_mode: Scheduling mode ("gcn", "gat", "random", "greedy").
         topology_scenario: Optional named topology scenario for mobility routes.
         topology_metrics: Optional topology metrics stored in checkpoints.
+        experiment_note: Optional note stored in checkpoint metadata.
 
     Returns:
         Tuple of metric history and optional trainable model checkpoint payload.
     """
     print(f"\n{'='*50}\nStarting Training for: {algo_name}\n{'='*50}")
-    set_seed(75)  # Reset seed for fair comparison
     confirmed = PAPER_PARAMS["confirmed"]
     provisional = PAPER_PARAMS["provisional_table2_needed"]
+    experiment_seed = int(provisional["experiment_seed"])
+    set_seed(experiment_seed)  # Reset seed for fair comparison.
 
     time_slots = int(confirmed["time_slots"])
     env = DITENEnv(
@@ -961,7 +973,9 @@ def train_algorithm(
         elif not uses_graph_gat_mappo:
             _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
     
-        if episode_number % 500 == 0 or episode_number == 1:
+        if episode_number == 1 or _should_print_diagnostics(
+            episode_number, num_episodes
+        ):
             print(
                 f"[{algo_name}] Ep {episode_number}/{num_episodes} ----|--- Avg R/Slot: {history['reward'][-1]:.3f} "
                 f"---|--- D: {history['delay'][-1]:.3f}s ---|--- E: {history['energy'][-1]:.3f}J"
@@ -1007,6 +1021,8 @@ def train_algorithm(
         graph_node_feature_dim=graph_node_feature_dim if uses_graph_gat_mappo else None,
         graph_edge_feature_dim=graph_edge_feature_dim if uses_graph_gat_mappo else None,
         topology_metrics=topology_metrics,
+        experiment_note=experiment_note,
+        experiment_seed=experiment_seed,
     )
     return history, checkpoint
 
@@ -1088,6 +1104,11 @@ if __name__ == "__main__":
     algorithm_episode_counts = {}
     last_training_state_rows = []
     model_checkpoints = []
+    experiment_note = args.note.strip()
+    experiment_seed = int(provisional["experiment_seed"])
+    if experiment_note:
+        print(f"Experiment note: {experiment_note}")
+    print(f"Experiment seed: {experiment_seed}")
 
     # Fig.6-style priority extraction comparison under fixed e-ATN-MADDPG.
     priority_modes = {"Random Scheduling": "random", "Greedy Scheduling": "greedy", "GCN Scheduling": "gcn", "GAT Scheduling": "gat"}
@@ -1138,6 +1159,7 @@ if __name__ == "__main__":
             priority_mode=priority_model_name,
             topology_scenario=topology_scenario,
             topology_metrics=topology_metrics,
+            experiment_note=experiment_note,
         )
         results["reward"][algo_name] = history["reward"]
         results["delay"][algo_name] = history["delay"]
@@ -1148,6 +1170,8 @@ if __name__ == "__main__":
                 history,
                 episode_count=run_episodes,
                 topology_metrics=topology_metrics,
+                experiment_note=experiment_note,
+                experiment_seed=experiment_seed,
             )
         )
         if checkpoint is not None:
@@ -1161,6 +1185,7 @@ if __name__ == "__main__":
         last_training_state_rows=last_training_state_rows,
         model_checkpoints=model_checkpoints,
         fixed_baseline_algorithms=FIXED_BASELINE_ALGORITHMS,
+        experiment_note=experiment_note,
     )
     last_state_path = output_paths["last_state_path"]
     checkpoint_paths = output_paths["checkpoint_paths"]

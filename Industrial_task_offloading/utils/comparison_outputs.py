@@ -52,6 +52,8 @@ def build_last_training_state_line(
     history: Dict[str, List[float]],
     episode_count: int,
     topology_metrics: Optional[Dict[str, object]] = None,
+    experiment_note: str = "",
+    experiment_seed: Optional[int] = None,
 ) -> Dict[str, object]:
     """Build one flat JSONL row for the final training state of one model."""
 
@@ -88,6 +90,10 @@ def build_last_training_state_line(
         "graph_warmup_loss": last_value("graph_warmup_loss"),
         "graph_warmup_count": int(round(last_value("graph_warmup_count"))),
     }
+    if experiment_note:
+        row["experiment_note"] = experiment_note
+    if experiment_seed is not None:
+        row["experiment_seed"] = int(experiment_seed)
     if topology_metrics is not None:
         row.update(flatten_topology_metrics(topology_metrics))
     return row
@@ -106,6 +112,8 @@ def build_model_checkpoint(
     graph_node_feature_dim: Optional[int] = None,
     graph_edge_feature_dim: Optional[int] = None,
     topology_metrics: Optional[Dict[str, object]] = None,
+    experiment_note: str = "",
+    experiment_seed: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build a serializable checkpoint payload for a trainable algorithm."""
     agent_states = [
@@ -132,9 +140,18 @@ def build_model_checkpoint(
         "num_servers": int(num_servers),
         "agents": trainable_agent_states,
         "final_metrics": build_last_training_state_line(
-            algo_name, history, episode_count, topology_metrics=topology_metrics
+            algo_name,
+            history,
+            episode_count,
+            topology_metrics=topology_metrics,
+            experiment_note=experiment_note,
+            experiment_seed=experiment_seed,
         ),
     }
+    if experiment_note:
+        checkpoint["experiment_note"] = experiment_note
+    if experiment_seed is not None:
+        checkpoint["experiment_seed"] = int(experiment_seed)
     if topology_metrics is not None:
         checkpoint["topology_metrics"] = topology_metrics
     if graph_node_feature_dim is not None or graph_edge_feature_dim is not None:
@@ -151,15 +168,18 @@ def save_comparison_outputs(
     last_training_state_rows: Sequence[Dict[str, object]],
     model_checkpoints: Sequence[Dict[str, Any]],
     fixed_baseline_algorithms: frozenset[str],
+    experiment_note: str = "",
 ) -> Dict[str, object]:
     """Save plots, final JSONL rows, and model checkpoints."""
-    plotter = DITENPlotter2()
+    date_string = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+    safe_note = _safe_experiment_note(experiment_note)
+    output_folder = f"{date_string}-{safe_note}" if safe_note else date_string
+    plotter = DITENPlotter2(save_dir=os.path.join("plots", output_folder))
     plot_results = build_plot_results(
         raw_results,
         target_episodes=full_episodes,
         fixed_baseline_algorithms=fixed_baseline_algorithms,
     )
-    date_string = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
     plot_paths = _save_training_plots(plotter, plot_results, date_string)
     last_state_path = os.path.join(
         plotter.save_dir, f"{date_string}_last_training_state.jsonl"
@@ -182,6 +202,22 @@ def _mean_flat_history(history: Sequence[float], target_episodes: int) -> List[f
         return []
     mean_value = float(sum(history) / len(history))
     return [mean_value for _ in range(target_episodes)]
+
+
+def _safe_experiment_note(note: str) -> str:
+    """Return a filesystem-safe suffix for an experiment note."""
+    safe_chars = []
+    for char in note.strip().lower():
+        if char.isascii() and char.isalnum():
+            safe_chars.append(char)
+        elif char in {"-", "_"}:
+            safe_chars.append(char)
+        elif char.isspace():
+            safe_chars.append("_")
+        else:
+            safe_chars.append("_")
+    safe_note = "".join(safe_chars)
+    return "_".join(part for part in safe_note.split("_") if part).strip("-_")
 
 
 def _write_last_training_state_jsonl(

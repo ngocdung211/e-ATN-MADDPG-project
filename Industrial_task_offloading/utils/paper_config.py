@@ -37,6 +37,8 @@ PAPER_PARAMS: Dict[str, Dict[str, float]] = {
         "replay_buffer_capacity": 100000,
         "comparison_full_episodes": 500,
         "baseline_evaluation_episodes": 5,
+        "experiment_seed": 75,
+        "diagnostic_interval_episodes": 250,
         "subslot_count": 200,
         "lambda1": 2.0,
         "lambda2": 2.0,

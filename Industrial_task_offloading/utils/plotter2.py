@@ -1,7 +1,6 @@
 """Plotting utilities for comparison experiments."""
 
 import os
-import time
 from typing import Dict, List
 
 import matplotlib.pyplot as plt
@@ -73,12 +72,7 @@ class DITENPlotter2:
         plt.legend(loc='best', framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.6)
         
-        # Save the plot
-        
-        date_string = time.strftime("%Y-%m-%d_%H", time.localtime())
-        # folder = os.join('plots',date_string)
-        os.makedirs(f"plots/{date_string}", exist_ok=True)
-        self.save_dir = f"plots/{date_string}"
+        os.makedirs(self.save_dir, exist_ok=True)
         filepath = os.path.join(self.save_dir, filename)
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
         plt.close()

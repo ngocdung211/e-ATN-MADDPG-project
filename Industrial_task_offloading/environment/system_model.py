@@ -105,10 +105,6 @@ class IndustrialDevice:
         if norm > 0:
             self.direction = direction / norm
 
-    def project_location(self, duration_s: float) -> np.ndarray:
-        """Project device location after moving with fixed speed and direction."""
-        return self.location + self.direction * self.speed_mps * duration_s
-
 class EdgeServer:
     """Represent an edge server s_j."""
 

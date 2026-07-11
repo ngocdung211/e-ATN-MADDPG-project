@@ -182,22 +182,3 @@ def load_or_train_priority_model(
     priority_model.eval()
     return priority_model
 
-
-def load_or_train_gcn(
-    gcn_model: torch.nn.Module,
-    dag_sampler: Callable[[], TaskDAG],
-    checkpoint_path: str,
-    epochs: int = 200,
-    samples_per_epoch: int = 32,
-    lr: float = 1e-3,
-) -> torch.nn.Module:
-    """Load a pretrained GCN model or train one if missing."""
-    return load_or_train_priority_model(
-        priority_model=gcn_model,
-        dag_sampler=dag_sampler,
-        checkpoint_path=checkpoint_path,
-        epochs=epochs,
-        samples_per_epoch=samples_per_epoch,
-        lr=lr,
-        model_label="GCN",
-    )
