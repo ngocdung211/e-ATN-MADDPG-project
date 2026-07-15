@@ -1,4 +1,4 @@
-"""Train or load GCN models for task priority extraction."""
+"""Train or load graph models for task-priority extraction."""
 
 from __future__ import annotations
 
@@ -87,8 +87,8 @@ def _compute_successor_cpu(task_dag: TaskDAG) -> Dict[int, float]:
     return memo
 
 
-def build_priority_targets(task_dag: TaskDAG) -> torch.Tensor:
-    """Build supervised priority targets for GCN pretraining.
+def build_task_priority_targets(task_dag: TaskDAG) -> torch.Tensor:
+    """Build supervised targets for task-priority model pretraining.
 
     Args:
         task_dag: Task DAG definition.
@@ -157,10 +157,10 @@ def load_or_train_priority_model(
         epoch_loss = 0.0
         for _ in range(samples_per_epoch):
             task_dag = dag_sampler()
-            from utils.graph_utils import extract_gcn_inputs
+            from utils.graph_utils import extract_task_graph_inputs
 
-            features, adjacency = extract_gcn_inputs(task_dag)
-            y = build_priority_targets(task_dag)
+            features, adjacency = extract_task_graph_inputs(task_dag)
+            y = build_task_priority_targets(task_dag)
             pred = priority_model(features, adjacency)
             loss = F.mse_loss(pred, y)
 
@@ -181,4 +181,3 @@ def load_or_train_priority_model(
     print(f"Saved {model_label} weights to: {checkpoint_path}")
     priority_model.eval()
     return priority_model
-

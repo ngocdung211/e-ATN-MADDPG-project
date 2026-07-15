@@ -12,18 +12,24 @@
 
 ---
 
-## Active Research Plan - 2026-07-08
+## Active Research Plan - Updated 2026-07-14
 
 **Status:** This section is the active plan. Older open queues below are historical context unless a task is explicitly moved here.
 
 **Current research questions:**
 - Does `Graph-GAT Mask MAPPO` fail because the topology encoder is trained from scratch inside PPO?
 - Does `Graph-GAT Mask MAPPO` help more when the topology is larger, denser, and harder than the current 10-device/3-server map?
+- Why does CPU runtime grow from about 1.5 hours on the 10-device map to 8 hours on the 20-device map and 16 hours on the 30-device map for Graph-GAT MAPPO?
+- After batching Graph-GAT, which environment operations account for the remaining wall-clock time, and can they be optimized without changing the simulated delay, reward, mobility, or connection-window semantics?
+- How should the physical system, digital-twin belief state, task-level GAT, and topology-level GAT be connected so the implementation matches the proposed dual-GAT DITEN architecture?
 - How can we prove `GAT Scheduling` is better than `GCN Scheduling` for task priority, instead of only showing one lucky training curve?
 
 **Success criteria:**
 - Pretrained Topology-GAT experiments compare at least three variants under the same seeds and episode budget: scratch, pretrained-frozen, and pretrained-finetuned.
 - Larger-topology experiments report topology complexity metrics, not only reward/delay/energy.
+- The Graph-GAT CPU path is profiled before optimization, preserves actor locality and numerical behavior, and becomes at least 5x faster on a fixed medium/large benchmark.
+- Environment wall-clock profiling accounts for at least 90% of an episode, clearly separates simulated seconds from runtime seconds, and preserves fixed-seed connection windows and reward trajectories after optimization.
+- The final proposal explicitly separates physical truth from digital-twin observations and fuses the current-subtask GAT embedding, topology-GAT embedding, and DT scalar state before action selection.
 - GAT-vs-GCN task-priority evidence is separated into supervised priority quality, fixed-policy scheduling quality, and end-to-end DRL impact.
 - Every result includes the exact config, checkpoint path, seed list, final JSONL row, and plot path.
 
@@ -33,16 +39,17 @@ Goal: make the plan match the code before adding new experiments.
 
 - [x] Treat the old `Next Task Queue`, old `Ablation Study Queue`, and old `Implementation Checklist` as historical context.
 - [x] Move the remaining active work into this 2026-07-08 section.
-- [ ] Repair the local CPU PyTorch runtime before trusting tests on this Mac.
-  - Current blocker: importing `torch` fails because `libtorch_cpu.dylib` is missing from the checked Conda environments.
-  - Verify: `python -c "import torch; print(torch.__version__)"` works in the selected project environment.
+- [x] Select a working local CPU PyTorch runtime for tests on this Mac.
+  - The base Conda environment remains broken because `libtorch_cpu.dylib` is missing.
+  - Use `/Users/admin/miniconda3/envs/task_offloading/bin/python`; it imports PyTorch `2.13.0` successfully.
+  - Verify: `/Users/admin/miniconda3/envs/task_offloading/bin/python -c "import torch; print(torch.__version__)"` works.
 - [x] Align model names across plan, config, tests, plots, and JSONL.
   - Standard names: `Graph-GAT MAPPO` for the unmasked ablation and `Graph-GAT Mask MAPPO` for the masked proposal.
   - Reason: these names make clear that the GAT is the topology encoder, not the task-priority GAT.
   - Verify: `tests/test_graph_gat_mappo.py` expects the same names returned by `run_comparision.build_algorithm_configs`.
-- [x] Drop GPU-device work from the active plan.
-  - Decision: keep `GraphGATMAPPOAgent` as CPU/default-device code for now.
-  - Impact: do not add a `device` argument, do not pass `graph_gat_device`, and do not plan Windows GPU smoke runs in the active queue.
+- [x] Defer GPU-device work until the CPU path is profiled and refactored.
+  - Decision: fix the avoidable Python-loop and repeated-encoding cost first.
+  - Impact: optional CUDA support may be reconsidered only after CPU numerical-equivalence and scaling tests pass.
 
 ### Phase 1: Pretrained Topology-GAT Experiment
 
@@ -153,8 +160,8 @@ Goal: test whether Graph-GAT Mask MAPPO only shows value when topology is comple
      - best pretrained mode from Phase 1, if available.
    - Scenarios:
      - `paper_10d_3s`;
-     - `medium_20d_5s`;
-     - `large_30d_8s`.
+     - `medium_20d_6s`;
+     - `large_30d_10s`.
    - Verify:
      - no scenario has impossible all-disconnected or all-connected topology unless intentionally configured;
      - reward/delay/energy are finite.
@@ -172,6 +179,302 @@ Goal: test whether Graph-GAT Mask MAPPO only shows value when topology is comple
      - inspect attention weights or edge-feature sensitivity;
      - check whether flat state already gives MAPPO all topology information in an easy-to-learn order;
      - do not tune reward before checking those explanations.
+
+### Phase 2.5: Current Ablation Study Matrix
+
+Goal: prove which implemented component improves MAPPO before adding pretrained Topology-GAT.
+
+**Status - 2026-07-13:** The remote screen reported `All training complete` and displayed saved plots, checkpoints, and the final JSONL path. Do not restart it. The outputs still need to be copied/imported and audited locally before marking the ablation rows complete.
+
+**Monitoring checkpoint - 2026-07-13:** Optional W&B monitoring is implemented with disabled, online, and offline modes. Each algorithm uses a separate run in one comparison group and logs one aligned record per episode. Online mode does not upload datasets, checkpoints, or source code. Windows setup and commands are documented in `docs/wandb_tracking.md`.
+
+**Observed wall-clock cost reported during the run:**
+- 10 devices: Graph-GAT MAPPO takes about 1.5 hours.
+- 20 devices: MAPPO takes about 1.5 hours, while Graph-GAT MAPPO takes about 8 hours.
+- 30 devices: Graph-GAT MAPPO takes about 16 hours.
+
+1. [ ] **Run core component ablation on the medium map**
+   - Scenario: `medium_20d_6s`.
+   - Same seed from `utils/paper_config.py::PAPER_PARAMS["provisional_table2_needed"]["experiment_seed"]`.
+   - Same episode budget from `comparison_full_episodes` or the command `--episodes`.
+   - Compare:
+     - `MAPPO`;
+     - `Mask-MAPPO`;
+     - `Graph-GAT MAPPO`;
+     - `Graph-GAT Mask MAPPO`;
+     - `Graph-GAT Warmup MAPPO`;
+     - `Graph-GAT Warmup Mask MAPPO`.
+   - Verify:
+     - final JSONL has one row per model;
+     - note includes map, purpose, episode count, and seed;
+     - reward, delay, energy, penalty count, local/edge ratio, and graph warmup metrics are saved.
+
+2. [ ] **Run core component ablation on the large map**
+   - Scenario: `large_30d_10s`.
+   - Use the same model list and seed as the medium run.
+   - Purpose: show whether Graph-GAT helps more when there are more agents, servers, and overlapping coverage choices.
+   - Success signal:
+     - `Graph-GAT Mask MAPPO` or `Graph-GAT Warmup Mask MAPPO` improves more over `Mask-MAPPO` on the large map than on the medium map.
+
+3. [ ] **Run paper-map control ablation if medium/large results are promising**
+   - Scenario: `paper_10d_3s`.
+   - Purpose: show the small topology is easier, so the GAT advantage may be smaller.
+   - Use this as a control, not the main evidence if the small map is too simple.
+
+4. [ ] **Summarize ablation evidence**
+   - Required tables:
+     - final reward/delay/energy by model and map;
+     - penalty count and edge success behavior;
+     - topology metrics from JSONL.
+   - Required plots:
+     - reward curve;
+     - delay curve;
+     - energy curve.
+   - Interpretation:
+     - `Mask-MAPPO - MAPPO` estimates the value of action masking;
+     - `Graph-GAT MAPPO - MAPPO` estimates the value of topology embedding;
+     - `Graph-GAT Mask MAPPO - Mask-MAPPO` estimates the added value of GAT after masking;
+     - `Graph-GAT Warmup Mask MAPPO - Graph-GAT Mask MAPPO` estimates the value of online topology warmup.
+
+---
+
+### Phase 2.6: Graph-GAT CPU Runtime and Scaling Repair
+
+Goal: explain and remove avoidable Graph-GAT cost before rerunning medium/large ablations or adding more model variants.
+
+**Source-audit findings to verify with a profiler:**
+- `GraphGATMAPPOAgent._encode_local_actor_embeddings` performs one encoder call per device.
+- `_local_subgraph_for_device` rebuilds tensors and scans the complete topology edge list for every device.
+- `_policy_and_values_for_graphs` loops over every rollout transition for every PPO epoch, then separately encodes local actor graphs and the global critic graph.
+- With `P` PPO epochs and `N` devices, each transition causes approximately `(P + 1)N + P + 2` encoder forwards across action collection and update; with `P=4`, this is `5N+6` forwards.
+- `TopologyGraphAttentionLayer.forward` loops over every node and builds a boolean mask over all edges in each of its two layers.
+- The graph currently stores both connected and disconnected device-server pairs, so it carries `2NS` directed edges even though the builder documentation calls them valid links.
+- Repeated `.tolist()`, Python dictionaries, small tensor construction, and unbatched CPU kernels amplify overhead as devices and servers increase.
+
+**Implementation checkpoint - 2026-07-13:**
+- The local Actor topology path now uses one batched dense bipartite attention call for all devices instead of `N` sequential local-graph encoder calls.
+- Warmup targets and action masks now use the ordered `(N, S, 2, E)` edge tensor directly instead of scanning edge tuples.
+- The centralized critic now uses dense bipartite global attention instead of the per-node incoming-edge loop.
+- PPO evaluation now stacks the complete rollout as `(T, N, S, ...)` tensors. With four PPO epochs, encoder calls are reduced from approximately `(5N+6)T` in the original path to `T+10`: `T` online local-Actor calls during environment collection, two batched global value calls, and eight batched Actor/Critic calls across the four PPO epochs.
+- Sequential-reference verification passes for embeddings and encoder gradients; the maximum observed embedding difference is `1.79e-7`, and the actor-locality test remains exact.
+- A single-thread local-Actor microbenchmark measured approximately `6.1x`, `13.3x`, and `27.0x` speedup for 10/3, 20/6, and 30/10 device/server sizes. These are local-Actor measurements, not end-to-end training claims.
+- A single-thread global-encoder microbenchmark measured approximately `2.3x`, `3.9x`, and `5.5x` speedup for 10/3, 20/6, and 30/10 device/server sizes, with maximum embedding difference `1.79e-7`.
+- A synthetic PPO forward/backward benchmark with `T=20`, one CPU thread, and 64-dimensional embeddings measured `5.98x`, `2.78x`, and `1.52x` speedup for 10/3, 20/6, and 30/10 device/server sizes. This isolates model evaluation and backpropagation; it is not an end-to-end training claim.
+- Batched rollout log-probabilities, values, and gradients match the sequential reference within `1e-6`; relevant Graph-GAT/topology tests: 25/25 pass in the `task_offloading` Conda environment.
+
+1. [ ] **Preserve and annotate the running ablation**
+   - Record the exact command, scenario, seed, episode count, priority model, PPO epochs, and warmup settings.
+   - Save elapsed time separately for graph build, warmup, action selection, rollout update, and total model time.
+   - Do not use this long run as the optimization benchmark because its models have different workloads.
+   - Verify: every completed model has a checkpoint/final JSONL row, and incomplete models are clearly labeled rather than silently rerun.
+
+2. [ ] **Build a deterministic scaling benchmark before changing code**
+   - Run the same fixed number of transitions and PPO updates for `paper_10d_3s`, `medium_20d_6s`, and `large_30d_10s`.
+   - Add counters for local-subgraph builds, local encoder forwards, global encoder forwards, actor time, critic time, and backward time.
+   - Use `cProfile` and a PyTorch CPU profiler on a 1-3 episode run after the local PyTorch runtime is repaired.
+   - Verify: the measured encoder-call count matches the expected formula and the top functions explain most of the Graph-GAT/MAPPO gap.
+
+3. [x] **Remove repeated local-subgraph construction**
+   - Reshape the builder's ordered edge features directly into `(N, S, 2, E)` tensors.
+   - Represent all device-local bipartite graphs as one batched tensor operation instead of creating `N` `TopologyGraphState` objects per forward.
+   - Eliminate `.tolist()`, Python membership checks, and per-device full-edge scans from the hot path.
+   - Preserve decentralized actor semantics: changing another device's private state must not change the selected device's actor probabilities.
+   - Verify: fixed-seed local embeddings and encoder gradients match the sequential implementation within `1e-6`; actor locality remains unchanged.
+
+4. [x] **Vectorize topology attention and action masks**
+   - Completed for device-local Actor attention, centralized global critic attention, topology warmup targets, and action masks.
+   - Replace the per-node incoming-edge loop with batched dense bipartite attention or indexed/scatter aggregation.
+   - Build the feasibility matrix directly as shape `(num_devices, num_servers)` and derive action masks without scanning edge tuples.
+   - Keep disconnected pairs as present edges with an explicit disconnected feature so the optimized path remains equivalent to existing experiments.
+   - Verify: complete-graph embeddings, centralized critic values, and encoder gradients match the sequential graph implementation within `1e-6`.
+
+5. [x] **Batch rollout evaluation across transitions**
+   - Stack fixed-shape graph tensors across the rollout time dimension.
+   - Compute policy log-probabilities, entropy, and critic values in batches for each PPO epoch.
+   - Avoid recomputing embeddings that are identical within the same loss evaluation, while retaining gradients where the encoder is trainable.
+   - Verify: policy outputs, critic values, and encoder/Actor/Critic gradients match the sequential implementation within `1e-6`; PPO update uses `2 + P` global rollout batches and `P` local rollout batches.
+
+6. [ ] **Benchmark each optimization separately**
+   - Report wall time, encoder-call count, peak memory, and speedup for 10/20/30 devices.
+   - Primary target: at least 5x faster than the current Graph-GAT path on a fixed medium/large CPU benchmark.
+   - Scaling target: runtime growth should be explained by tensor sizes, not nested Python loops.
+   - Only after CPU equivalence passes, evaluate optional CUDA/device support and `torch.compile`; do not use GPU migration to hide an inefficient algorithm.
+
+7. [ ] **Rerun only the interrupted or invalidated ablation rows**
+   - Existing completed results remain valid if the optimized implementation is numerically equivalent.
+   - If behavior changes beyond tolerance, label old/new implementations separately and rerun the full controlled matrix.
+
+### Phase 2.6.1: Environment Wall-Clock Profiling and Connection-Window Repair
+
+Goal: remove the new dominant CPU cost after Graph-GAT batching, while preserving the exact environment trajectory and scientific meaning of the experiment.
+
+**Metric-semantics correction - 2026-07-14:**
+- W&B metrics `execution/wait_seconds` and `penalty/seconds` are simulated scheduling delays. They are outputs of the physical model, not CPU wall-clock measurements and must not be used to locate runtime bottlenecks.
+- The controlled five-episode `large_30d_10s` comparison completed in 136.43 seconds on CPU and 133.58 seconds on RTX A4000 CUDA, only about `1.02x` end-to-end speedup.
+- On the final episode, Graph-GAT action plus PPO update took 1.66 seconds on CPU and 0.98 seconds on CUDA. CUDA accelerated the PPO update by about `3.27x`, but this model-only saving is a small part of the episode.
+
+**Local source audit and microbenchmark evidence - 2026-07-14:**
+- `_update_connection_windows` loops in Python over every device, server, and `subslot_count + 1` sample and calls `np.linalg.norm` on each two-element location separately.
+- With `subslot_count=200`, an episode invokes the function 101 times: once in `reset_episode`, 50 times in `start_time_slot`, and 50 times after each completed slot in `step`. Consecutive calls often recompute the same slot, and the final call computes a terminal window that may not be consumed.
+- Approximate sampled coverage checks per episode are 609,030 for `paper_10d_3s`, 2,436,120 for `medium_20d_6s`, and 6,090,300 for `large_30d_10s`.
+- Measured local cost for 101 window updates is about 1.42, 5.61, and 14.06 seconds for the 10/3, 20/6, and 30/10 scenarios.
+- A controlled large all-local environment episode took 14.04 seconds normally and 0.24 seconds when repeated window recomputation was disabled after creating an initial valid window. The 13.80-second difference is about 98% of this environment-only microbenchmark; it is not yet an end-to-end remote training result.
+- Generating 50 slots of DAGs from 798 local images plus 1,500 unbatched Task-GAT priority forwards took about 0.39 seconds locally. Keep these as secondary candidates unless the full profiler ranks them higher on Windows or the synced drive.
+
+**Implementation and verification checkpoint - 2026-07-14:**
+- `DITENEnv` now records connection-window requests, actual updates, sampled points, connection-window wall time, joint-state wall time, and joint-state calls. The comparison runner separately records DAG generation, priority inference, slot initialization, action collection, environment steps, metric summarization, rollout storage, model update, accounted time, unaccounted time, and tracker-log time.
+- W&B retains the legacy `execution/*` keys for compatibility and adds explicit `simulation/*` keys so modeled queue/transfer/penalty seconds are not confused with `runtime/*` wall-clock seconds.
+- An unchanged slot/position/direction/server signature now reuses the cached windows. A normal 50-slot episode still makes 101 requests but performs only 51 actual updates.
+- Sampled positions and device-server distances are evaluated with NumPy broadcasting. The first connected sample and first subsequent disconnected sample preserve the previous sequential semantics.
+- Vectorized windows match the sequential reference within `1e-12` on all 10/3, 20/6, and 30/10 scenario tests. Cache invalidation and slot-transition tests pass.
+- Three-repeat deterministic benchmark medians after repair are 0.034/0.086/0.179 seconds total environment time for 10/3, 20/6, and 30/10. Connection-window time is 0.008/0.025/0.065 seconds.
+- The matched large all-local environment protocol fell from 14.04 seconds before repair to 0.324 seconds after repair, about `43x` faster. The deterministic fixed-task benchmark is 0.182 seconds, about `77x` faster than the earlier environment-only observation, but the fixed-task protocol excludes per-slot image/DAG generation.
+- A one-episode large Graph-GAT MAPPO CPU smoke run completed in 3.62 seconds. Accounted phases totaled 3.61 seconds with 0.010 seconds unaccounted; connection windows used 0.073 seconds, environment steps 0.206 seconds, action collection 0.739 seconds, rollout storage 0.428 seconds, and PPO update 1.993 seconds.
+- Post-repair joint-state construction is about 0.073 seconds in the large deterministic benchmark and is below 5% of the 3.62-second Graph-GAT smoke episode. No secondary environment optimization is justified yet.
+
+1. [x] **Add true wall-clock phase instrumentation**
+   - Measure DAG generation, task-priority inference, `start_time_slot`, `env.step`, connection-window updates, joint-state construction, Graph-GAT rollout-buffer push, optimizer update, W&B logging, and unaccounted episode time with `time.perf_counter`.
+   - Log connection-window call count and sampled pair count per episode.
+   - Keep simulated delay metrics, but expose them under an explicitly simulated namespace or label so they cannot be confused with profiler timings.
+   - Verify: timed phases account for at least 90% of episode wall time and their sum does not materially increase runtime.
+
+2. [x] **Add a deterministic environment scaling benchmark**
+   - Benchmark exactly 50 slots and five subtasks per slot on 10/3, 20/6, and 30/10 with fixed DAGs, actions, seed, and no W&B/network upload.
+   - Capture `cProfile` output and per-function timers for the normal path.
+   - Verify: results report total environment time, connection-window time/calls, state-build time, scheduling time, and checks per second for every topology.
+
+3. [x] **Remove duplicate connection-window recomputation**
+   - Give one lifecycle point ownership of each slot's connection-window update, or cache by current slot plus device position/direction so repeated calls are no-ops.
+   - Do not remove a terminal update until tests prove the terminal `next_state` and rollout semantics do not consume it.
+   - Verify: fixed-seed windows, states, masks, actions, rewards, penalties, and done flags match the current implementation exactly; measured calls fall from 101 to at most 51 per episode.
+
+4. [x] **Vectorize sampled connection-window evaluation**
+   - Precompute the `(subslot_count + 1)` relative time offsets.
+   - Use NumPy broadcasting to evaluate device positions and distances for all device-server-time samples in batches instead of millions of tiny Python/NumPy calls.
+   - Preserve the current sampled first-entry/first-exit behavior before considering an analytical line-circle intersection implementation.
+   - Verify: every `(window_start, window_end)` matches the sequential reference within `1e-12` across all scenarios, route segments, boundary contacts, always-disconnected links, and links that remain connected through the horizon.
+
+5. [x] **Evaluate secondary environment costs and defer unjustified changes**
+   - Candidates: batch the 1,500 Task-GAT priority forwards, cache image metadata instead of reopening image files from the synced drive, reuse static priority adjacency/features, and reduce temporary Python dictionaries in `_get_joint_state` and `step`.
+   - Do not add these changes based only on asymptotic suspicion; require a measured contribution of at least 5% after connection-window repair.
+   - Verify each accepted optimization independently against fixed-seed outputs and wall time.
+
+6. [ ] **Run end-to-end CPU/CUDA validation after environment repair**
+   - Run matched 20-30 episode CPU and CUDA Graph-GAT MAPPO jobs on `large_30d_10s`, same seed and configuration, excluding episode one from median timing.
+   - Report median episode time, environment time, connection-window time, graph build/action/update time, unaccounted time, and GPU memory.
+   - Success targets: at least `5x` faster connection-window evaluation, at least `3x` faster environment-only large benchmark, and no fixed-seed trajectory difference. Treat end-to-end speedup as a measured result rather than a guaranteed target.
+
+### Phase 2.6.2: Graph-GAT 1000-Episode Stability Tuning
+
+Goal: determine whether stable PPO/encoder optimization lets masked Graph-GAT
+outperform Mask-MAPPO, without changing the environment, reward, or action
+mask.
+
+**500-episode evidence - 2026-07-15:**
+- All 24 runs completed for the 10/3, 20/6, and 30/10 maps with seed 75.
+- Action masking is mandatory: final unmasked Graph-GAT penalty counts were
+  1,688, 4,118, and 6,718, while masked Graph-GAT counts were 9, 36, and 108.
+- Mask-MAPPO won the paper and large maps. Graph-GAT Warmup Mask MAPPO only
+  won the medium map, so the topology encoder has not shown a consistent
+  scaling benefit.
+- Unmasked Graph-GAT reward collapsed late in training. Do not spend the new
+  budget tuning unmasked variants.
+
+1. [x] **Expose Graph-GAT optimization hyperparameters through the CLI**
+   - Overrides cover actor/critic LR, encoder LR, hidden/embedding width, PPO
+     clip/epochs, entropy coefficient, value-loss coefficient, gradient norm,
+     and topology-warmup duration/update rate/LR.
+   - Defaults preserve the 500-episode implementation.
+   - Verify: overrides apply only to Graph-GAT; warmup overrides apply only to
+     variants whose names include `Warmup`.
+
+2. [ ] **Run the unchanged 1000-episode medium control**
+   - Models: `Mask-MAPPO` and `Graph-GAT Warmup Mask MAPPO`.
+   - Keep seed 75 and all current hyperparameters.
+   - Purpose: separate the effect of a longer run from the effect of tuning.
+
+3. [ ] **Run stability candidate v1 on the medium map**
+   - Actor/critic LR `8e-5`; encoder LR `3e-5`; PPO clip `0.15`;
+     entropy coefficient `0.005`; value-loss coefficient `0.5`; gradient norm
+     `0.5`.
+   - Warmup: 20 episodes, two updates per step, LR `3e-4`.
+   - Keep hidden and embedding dimensions at 64 so this experiment isolates
+     optimization stability rather than capacity.
+   - Select using final-100-episode mean and standard deviation for reward,
+     delay, energy, penalty count, and edge ratio.
+
+4. [ ] **Transfer the selected configuration without per-map retuning**
+   - Reuse the exact medium-selected configuration on `paper_10d_3s` and
+     `large_30d_10s` for 1000 episodes.
+   - Compare against Mask-MAPPO with the same seed and episode budget.
+   - Do not claim improvement unless Graph-GAT is better across multiple
+     metrics and remains stable through episodes 900-1000.
+
+5. [ ] **Confirm the two finalists across multiple seeds**
+   - Candidates: Mask-MAPPO and the selected Graph-GAT Warmup Mask MAPPO.
+   - Add seed control before this step, then run at least three seeds.
+   - Report mean and standard deviation rather than the best seed.
+
+---
+
+### Phase 2.7: Digital-Twin and Dual-GAT Architecture Alignment
+
+Goal: implement the proposed model as a real DT-assisted dual-graph policy rather than a topology-GAT policy attached to a partially DT-like flat state.
+
+**Current implementation gap:**
+- `DITENEnv` already samples estimated device/server compute power and exposes queue waits, so it contains part of the manuscript's DT observation.
+- There is no explicit physical-state versus twin-state boundary, synchronization timestamp, observation delay/staleness, or recorded estimation deviation.
+- Environment execution and observation construction share the same objects, making it difficult to test whether the policy receives oracle physical state.
+- `TaskPriorityGAT` currently produces a priority order before environment execution; its per-subtask embedding is not passed to Graph-GAT MAPPO.
+- `GraphGATMAPPOAgent` consumes topology embeddings only. It does not implement the proposed fused state `[h_task || h_topo || z_DT]` for the current subtask.
+
+1. [ ] **Freeze the DT contract from the baseline paper and current manuscript**
+   - Physical truth includes actual device/server compute capability, queues, locations, channel/connectivity, tasks, and execution results.
+   - Twin belief includes estimated counterparts, last synchronization time, age/staleness, and deviation or confidence fields.
+   - Decide the synchronization cadence, observation delay, and noise model from cited equations/configuration before coding.
+   - Correct the manuscript notation typo `\hat{f}i^{loc}` and state explicitly which original deviation terms are retained or intentionally omitted.
+   - Verify: a table maps every paper state symbol to one owner, code field, normalization, and update time.
+
+2. [ ] **Add explicit digital-twin snapshot types**
+   - Candidate types: `DeviceTwinState`, `ServerTwinState`, `TaskTwinState`, and `DigitalTwinSnapshot`.
+   - Keep these as state containers first; do not change reward or environment physics in this task.
+   - Verify: snapshots can be serialized in checkpoints/JSONL metadata and reconstructed deterministically from a seeded environment.
+
+3. [ ] **Separate physical evolution from twin synchronization**
+   - Physical execution uses actual compute power, queues, mobility, and connectivity.
+   - Policy observations are built only from the latest twin snapshot.
+   - Add configurable perfect, noisy, and stale synchronization modes.
+   - Verify: perfect zero-error synchronization reproduces the legacy state and reward trajectory; noisy/stale modes change observations without directly changing physical truth.
+
+4. [ ] **Define DT-aware feasibility and masking semantics**
+   - The policy mask must be derived from twin-predicted connectivity, not hidden physical truth.
+   - Track mask false positives, false negatives, stale-link age, and actual offload rejection/fallback outcomes.
+   - Keep local execution valid for every device.
+   - Verify: tests cover twin-predicted connected/actual disconnected and twin-predicted disconnected/actual connected cases.
+
+5. [ ] **Expose task-GAT embeddings for the current subtask**
+   - Change the task GAT interface so it can return per-node embeddings as well as priority scores.
+   - Select the embedding of the current dependency-ready subtask for each device.
+   - Keep the existing priority-order output as a separate ablation feature rather than treating it as the task embedding.
+   - Verify: embeddings follow the DAG node IDs and do not violate predecessor constraints.
+
+6. [ ] **Implement the fused dual-GAT policy state**
+   - For each device/current subtask, build `[h_task || h_topo || z_DT]`.
+   - Actor input uses only the device's permitted local/twin information.
+   - Centralized critic may use the joint fused state during training.
+   - Verify: perturbing another device's private observation does not change the selected device's actor output, while the centralized critic may change.
+
+7. [ ] **Add DT and dual-GAT ablations**
+   - Compare flat DT state, task-GAT only, topology-GAT only, dual GAT, and dual GAT plus action mask.
+   - Compare perfect twin, noisy twin, and stale twin under the same seeds and topology.
+   - Report DT estimation error, synchronization age, mask error rates, reward, delay, energy, and runtime.
+   - Claim DT robustness only if the dual-GAT model remains better under controlled observation error/staleness.
+
+8. [ ] **Align the manuscript after verified implementation**
+   - Update equations, architecture diagram, algorithm pseudocode, complexity analysis, and experiment table from the implemented interfaces.
+   - Do not state that the two GAT embeddings are fused or that DT synchronization is modeled until the corresponding tests and ablations pass.
+
+---
 
 ### Phase 3: Prove GAT Task Priority Beats GCN Task Priority
 
@@ -238,15 +541,35 @@ Goal: separate task-priority quality from offloading-policy quality.
 
 ### Recommended Execution Order
 
-1. Fix local CPU PyTorch so tests can run.
-2. Use `Graph-GAT MAPPO` / `Graph-GAT Mask MAPPO` names consistently between tests, config, plots, and result JSONL.
-3. Add pretrained Topology-GAT infrastructure and run 1-3 episode smoke tests.
-4. Run the default 10-device/3-server short comparison.
-5. Add larger topology configs and diagnostics.
-6. Run medium/large topology comparisons.
-7. Run GCN-vs-GAT priority evidence in supervised, fixed-policy, and end-to-end layers.
+**Current status - 2026-07-14:** Steps 1-5 are complete locally. Step 6 is next and requires the synchronized Windows project to run the matched W&B CPU/CUDA commands from `docs/wandb_tracking.md`.
+
+1. Add wall-clock phase instrumentation that separates CPU runtime from simulated delay metrics.
+2. Run the deterministic 10/20/30-device environment scaling benchmark and archive profiler evidence.
+3. Remove duplicate connection-window recomputation and verify exact fixed-seed trajectory equivalence.
+4. Vectorize the sampled connection-window calculation and repeat the equivalence/scaling benchmarks.
+5. Optimize Task-GAT priority, dataset I/O, or state construction only if the post-repair profiler shows a contribution of at least 5%.
+6. Run matched 20-30 episode CPU/CUDA W&B validation on `large_30d_10s` and compare medians excluding episode one.
+7. Import and audit the completed remote ablation outputs; rerun only interrupted or behavior-invalidated rows.
+8. Freeze the physical-state/digital-twin-state contract from the baseline paper and current manuscript.
+9. Add explicit twin snapshots and synchronization while keeping environment physics unchanged.
+10. Expose current-subtask GAT embeddings, implement `[h_task || h_topo || z_DT]`, and run the controlled dual-GAT/DT ablations.
 
 ### Optional Waiting List
+
+- [ ] **CTDE-clean shared baseline models**
+  - Goal: make baseline learning models fairer when comparing against `Graph-GAT MAPPO`.
+  - Current status:
+    - `Graph-GAT MAPPO` is CTDE-style: actor uses local subgraph, critic uses global graph.
+    - Current `MAPPO` / `Mask-MAPPO` are CTDE-style only partially: actor uses local state and critic sees joint state, but each device owns a separate actor/critic object.
+    - Fixed baselines such as `Local Only`, `Edge Only`, and random/heuristic baselines are not CTDE models and should remain labeled as fixed baselines.
+  - Future implementation:
+    - add `Shared MAPPO`: one shared actor, one centralized critic, actor receives each device local state, critic receives joint state;
+    - add `Shared Mask-MAPPO`: same shared CTDE baseline with action masking;
+    - keep existing independent MAPPO names or clearly rename them as independent-agent baselines.
+  - Purpose:
+    - make ablation cleaner: `Shared MAPPO -> Shared Mask-MAPPO -> Graph-GAT MAPPO -> Graph-GAT Mask MAPPO`;
+    - support stronger paper claims about CTDE fairness across learned baselines.
+  - Status: optional future work. Do not block current Graph-GAT ablation runs.
 
 - [ ] **Graph-GAT MADDPG / GATMA-style CTDE**
   - Actor: local graph/subgraph embedding to local action.
@@ -418,10 +741,10 @@ Historical note: this queue recorded the earlier paper-reimplementation path. Us
      - `utils/gpu_readiness.py`
      - `docs/windows_gpu_readiness.md`
      - `tests/test_gpu_readiness.py`
-   - Verify:
-     - readiness helper runs on CPU-only machines. `DONE`
-     - Windows guide says to verify CUDA before changing training code. `DONE`
-     - no agent, replay-buffer, environment, or comparison training logic is moved to GPU yet. `DONE`
+   - Current status:
+     - Windows setup guide exists. `DONE`
+     - readiness helper reports human-readable and JSON CUDA status and fails clearly when required CUDA is unavailable. `DONE`
+     - CPU-only readiness and device-resolution tests pass. `DONE`
 
 10. [ ] **Only move one training path to CUDA after Windows readiness passes**
     - Goal: Avoid messy GPU bugs by proving the machine setup first.
@@ -432,10 +755,11 @@ Historical note: this queue recorded the earlier paper-reimplementation path. Us
       - GPU name shows the server GPU.
       - Mac CPU demo still remains the control path.
     - Status:
-      - [x] `GraphGATMAPPOAgent` accepts a `device` setting and moves encoder/actor/critic modules to that torch device.
+      - [x] `GraphGATMAPPOAgent` accepts a `device` setting and moves encoder/actor/critic/warmup modules to that torch device.
       - [x] Graph-GAT rollout update tensors are created on the agent device.
       - [x] Graph tensors remain built from CPU environment state, then move to the agent device at encode/mask boundaries.
-      - [x] `run_comparision.py` passes `graph_gat_device` from `utils/paper_config.py` only to `Graph-GAT MAPPO`.
+      - [x] `run_comparision.py` passes `graph_gat_device` from `utils/paper_config.py` or the CLI override only to Graph-GAT MAPPO variants.
+      - [x] CUDA timing synchronizes before/after Graph-GAT warmup, action selection, and PPO update.
       - [ ] Run 1-3 Graph-GAT MAPPO smoke episodes on the Windows GPU server.
 
 11. [x] **Add GAT as task-priority option beside GCN**
@@ -443,7 +767,7 @@ Historical note: this queue recorded the earlier paper-reimplementation path. Us
     - Files touched:
       - `models/task_priority_gat.py`
       - `utils/experiment_setup.py`
-      - `utils/gcn_training.py`
+      - `utils/priority_model_training.py`
       - `run_comparision.py`
       - `main.py`
       - `tests/test_task_priority_gat.py`

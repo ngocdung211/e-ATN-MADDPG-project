@@ -16,13 +16,13 @@ from models.replay_buffer import MultiAgentReplayBuffer
 from models.maddpg import EpsilonATNMADDPGAgent
 from dataset.data_loader import KolektorSDDLoader
 from utils.plotter import DITENPlotter
-from utils.gcn_training import load_or_train_priority_model
+from utils.priority_model_training import load_or_train_priority_model
 from utils.experiment_setup import (
     build_priorities,
     build_task_priority_model,
     generate_task_dags_for_episode,
     get_priority_checkpoint_path,
-    make_gcn_dag_sampler,
+    make_priority_dag_sampler,
 )
 from utils.paper_config import PAPER_PARAMS
 
@@ -309,7 +309,7 @@ if __name__ == "__main__":
         hidden_dim=int(confirmed["gcn_hidden_dim"]),
     )
     priority_ckpt_path = get_priority_checkpoint_path(priority_model_name)
-    sample_training_dag = make_gcn_dag_sampler(data_loader)
+    sample_training_dag = make_priority_dag_sampler(data_loader)
 
     priority_model = load_or_train_priority_model(
         priority_model=priority_model,

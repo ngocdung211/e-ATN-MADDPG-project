@@ -1,5 +1,6 @@
 """Digital twin environment for industrial task offloading."""
 
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -92,10 +93,19 @@ class DITENEnv:
         self.route_rectangles = route_rectangles
         self.world_min: np.ndarray = np.array([0.0, 0.0], dtype=float)
         self.world_max: np.ndarray = np.array([100.0, 100.0], dtype=float)
+        self._connection_window_cache_key: Optional[Tuple[object, ...]] = None
+        subslot_duration = self.slot_duration / float(self.subslot_count)
+        self._connection_window_time_offsets = (
+            np.arange(self.subslot_count + 1, dtype=float) * subslot_duration
+        )
+        self.runtime_metrics: Dict[str, float] = {}
+        self._reset_runtime_metrics()
         self._build_predetermined_paths()
 
     def reset_episode(self) -> None:
         """Reset episode state, device positions, and connection windows."""
+        self._reset_runtime_metrics()
+        self._connection_window_cache_key = None
         self.current_step = {d.id: 0 for d in self.devices}
         self.current_slot_index = 0
         self.current_slot = 0.0
@@ -121,6 +131,21 @@ class DITENEnv:
             device.set_direction(direction)
 
         self._update_connection_windows()
+
+    def _reset_runtime_metrics(self) -> None:
+        """Reset cumulative wall-clock counters for one episode."""
+        self.runtime_metrics = {
+            "connection_window_seconds": 0.0,
+            "connection_window_requests": 0.0,
+            "connection_window_updates": 0.0,
+            "connection_window_samples": 0.0,
+            "joint_state_seconds": 0.0,
+            "joint_state_calls": 0.0,
+        }
+
+    def get_runtime_metrics(self) -> Dict[str, float]:
+        """Return a copy of cumulative environment wall-clock counters."""
+        return dict(self.runtime_metrics)
 
     def start_time_slot(
         self, task_dags: Dict[int, TaskDAG], priorities: Dict[int, List[int]]
@@ -693,29 +718,89 @@ class DITENEnv:
 
     def _update_connection_windows(self) -> None:
         """Recompute connection windows for every device-server pair."""
-        self.connection_windows = {}
-        horizon = self.slot_duration
-        dt = self.slot_duration / float(self.subslot_count)
-        for device in self.devices:
-            for server in self.servers:
-                window_start: Optional[float] = None
-                window_end: Optional[float] = None
-                for k in range(self.subslot_count + 1):
-                    t_rel = k * dt
-                    loc = device.location + device.direction * device.speed_mps * t_rel
-                    inside = np.linalg.norm(loc - server.location) <= server.coverage_radius
-                    if inside and window_start is None:
-                        window_start = self.current_slot + t_rel
-                    if (not inside) and window_start is not None:
-                        window_end = self.current_slot + t_rel
-                        break
+        self.runtime_metrics["connection_window_requests"] += 1.0
+        cache_key = self._connection_window_signature()
+        if cache_key == self._connection_window_cache_key:
+            return
 
-                if window_start is None:
-                    window_start = self.current_slot + horizon
-                    window_end = self.current_slot + horizon
-                elif window_end is None:
-                    window_end = self.current_slot + horizon
-                self.connection_windows[(device.id, server.id)] = (window_start, window_end)
+        update_start = time.perf_counter()
+        device_locations = np.stack([device.location for device in self.devices])
+        device_velocities = np.stack(
+            [device.direction * device.speed_mps for device in self.devices]
+        )
+        server_locations = np.stack([server.location for server in self.servers])
+        coverage_radii = np.asarray(
+            [server.coverage_radius for server in self.servers], dtype=float
+        )
+
+        sampled_locations = (
+            device_locations[:, np.newaxis, :]
+            + device_velocities[:, np.newaxis, :]
+            * self._connection_window_time_offsets[np.newaxis, :, np.newaxis]
+        )
+        location_deltas = (
+            sampled_locations[:, np.newaxis, :, :]
+            - server_locations[np.newaxis, :, np.newaxis, :]
+        )
+        distances = np.linalg.norm(location_deltas, axis=3)
+        inside = distances <= coverage_radii[np.newaxis, :, np.newaxis]
+
+        has_inside_sample = np.any(inside, axis=2)
+        first_inside_index = np.argmax(inside, axis=2)
+        sample_indices = np.arange(inside.shape[2], dtype=int)
+        after_first_inside = (
+            sample_indices[np.newaxis, np.newaxis, :]
+            > first_inside_index[:, :, np.newaxis]
+        )
+        first_exit_candidates = (~inside) & after_first_inside
+        has_exit_sample = np.any(first_exit_candidates, axis=2)
+        first_exit_index = np.argmax(first_exit_candidates, axis=2)
+
+        horizon = self.slot_duration
+        start_offsets = self._connection_window_time_offsets[first_inside_index]
+        end_offsets = np.where(
+            has_exit_sample,
+            self._connection_window_time_offsets[first_exit_index],
+            horizon,
+        )
+        start_offsets = np.where(has_inside_sample, start_offsets, horizon)
+        end_offsets = np.where(has_inside_sample, end_offsets, horizon)
+
+        self.connection_windows = {
+            (device.id, server.id): (
+                self.current_slot + float(start_offsets[device_index, server_index]),
+                self.current_slot + float(end_offsets[device_index, server_index]),
+            )
+            for device_index, device in enumerate(self.devices)
+            for server_index, server in enumerate(self.servers)
+        }
+        self._connection_window_cache_key = cache_key
+        self.runtime_metrics["connection_window_seconds"] += (
+            time.perf_counter() - update_start
+        )
+        self.runtime_metrics["connection_window_updates"] += 1.0
+        self.runtime_metrics["connection_window_samples"] += float(inside.size)
+
+    def _connection_window_signature(self) -> Tuple[object, ...]:
+        """Return state fields that determine all sampled connection windows."""
+        device_state = tuple(
+            (
+                device.id,
+                *np.asarray(device.location, dtype=float).tolist(),
+                *np.asarray(device.direction, dtype=float).tolist(),
+                float(device.speed_mps),
+            )
+            for device in self.devices
+        )
+        server_state = tuple(
+            (
+                server.id,
+                *np.asarray(server.location, dtype=float).tolist(),
+                float(server.coverage_radius),
+            )
+            for server in self.servers
+        )
+        return (float(self.current_slot), device_state, server_state)
 
     def _build_predetermined_paths(self) -> None:
         """Initialize fixed mobility paths for industrial devices."""
@@ -833,6 +918,7 @@ class DITENEnv:
         Returns:
             Joint state array shaped (num_devices, state_dim).
         """
+        state_start = time.perf_counter()
         joint_state = []
         for device in self.devices:
             task_dag = self.task_dags[device.id]
@@ -878,7 +964,10 @@ class DITENEnv:
                 + window_ends
             )
             joint_state.append(state_vector)
-        return np.array(joint_state, dtype=np.float32)
+        joint_state_array = np.array(joint_state, dtype=np.float32)
+        self.runtime_metrics["joint_state_seconds"] += time.perf_counter() - state_start
+        self.runtime_metrics["joint_state_calls"] += 1.0
+        return joint_state_array
 
     def _calculate_reward(
         self, t_im: float, e_im: float, t_accm: float, e_accm: float, p_out: float, task_dag: TaskDAG

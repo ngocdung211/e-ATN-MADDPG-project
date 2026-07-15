@@ -78,8 +78,8 @@ def _compute_cumulative_successor_cpu(task_dag: TaskDAG) -> Dict[int, float]:
         dfs(sid)
     return memo
 
-def extract_gcn_inputs(task_dag: TaskDAG) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extract adjacency and feature matrices for GCN input.
+def extract_task_graph_inputs(task_dag: TaskDAG) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extract adjacency and feature matrices for task-priority graph models.
 
     Args:
         task_dag: Task DAG definition.

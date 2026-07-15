@@ -27,4 +27,9 @@ docs/superpowers/
 .claude/
 .codex/
 tests/
+!tests/
+tests/*
+!tests/test_gpu_readiness.py
+!tests/test_experiment_tracking.py
 plots/
+wandb/

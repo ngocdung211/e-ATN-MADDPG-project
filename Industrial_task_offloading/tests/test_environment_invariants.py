@@ -2,6 +2,7 @@
 
 import pathlib
 import sys
+from typing import Dict, Tuple
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from environment.diten_env import DITENEnv
 from environment.network_env import NetworkEnvironment
 from environment.system_model import EdgeServer, IndustrialDevice, Subtask, TaskDAG
+from utils.topology_scenarios_config import device_start_points, get_topology_scenario
 
 
 def _build_task_dag() -> TaskDAG:
@@ -72,6 +74,80 @@ def _build_env(server_location: np.ndarray) -> DITENEnv:
         local_estimation_error=0.0,
         edge_estimation_error=0.0,
     )
+
+
+def _build_scenario_env(scenario_name: str, subslot_count: int = 20) -> DITENEnv:
+    """Build a deterministic environment for a named topology."""
+    scenario = get_topology_scenario(scenario_name)
+    devices = [
+        IndustrialDevice(
+            device_id=device_index + 1,
+            location=start.copy(),
+            compute_power=1e9,
+            transmit_power=0.5,
+            energy_coeff=1e-28,
+            speed_mps=1.0,
+        )
+        for device_index, start in enumerate(device_start_points(scenario))
+    ]
+    servers = [
+        EdgeServer(
+            server_id=server_index + 1,
+            location=np.asarray(location, dtype=float),
+            compute_power=2e9,
+            transmit_power=1.2,
+            energy_coeff=1e-27,
+            coverage_radius=scenario.coverage_radius,
+        )
+        for server_index, location in enumerate(scenario.server_locations)
+    ]
+    return DITENEnv(
+        devices,
+        servers,
+        NetworkEnvironment(bandwidth=10e6, noise_power_dbm=-43),
+        slot_duration=1.0,
+        subslot_count=subslot_count,
+        time_slots=2,
+        local_estimation_error=0.0,
+        edge_estimation_error=0.0,
+        route_rectangles=scenario.route_rectangles,
+    )
+
+
+def _sequential_connection_windows(
+    env: DITENEnv,
+) -> Dict[Tuple[int, int], Tuple[float, float]]:
+    """Compute the pre-optimization sampled windows as a test reference."""
+    windows = {}
+    horizon = env.slot_duration
+    delta_time = env.slot_duration / float(env.subslot_count)
+    for device in env.devices:
+        for server in env.servers:
+            window_start = None
+            window_end = None
+            for sample_index in range(env.subslot_count + 1):
+                relative_time = sample_index * delta_time
+                location = (
+                    device.location
+                    + device.direction * device.speed_mps * relative_time
+                )
+                inside = (
+                    np.linalg.norm(location - server.location)
+                    <= server.coverage_radius
+                )
+                if inside and window_start is None:
+                    window_start = env.current_slot + relative_time
+                if not inside and window_start is not None:
+                    window_end = env.current_slot + relative_time
+                    break
+
+            if window_start is None:
+                window_start = env.current_slot + horizon
+                window_end = env.current_slot + horizon
+            elif window_end is None:
+                window_end = env.current_slot + horizon
+            windows[(device.id, server.id)] = (window_start, window_end)
+    return windows
 
 
 def test_joint_state_matches_declared_dimension() -> None:
@@ -155,3 +231,101 @@ def test_parallel_branch_delay_uses_dag_makespan() -> None:
     expected_makespan = max(delay_after_local_branch, edge_branch_finish_elapsed)
     assert edge_branch_finish_elapsed < delay_after_local_branch
     assert env.device_accumulated_delay[1] == pytest.approx(expected_makespan)
+
+
+@pytest.mark.parametrize(
+    "scenario_name",
+    ["paper_10d_3s", "medium_20d_6s", "large_30d_10s"],
+)
+def test_vectorized_connection_windows_match_sequential_reference(
+    scenario_name: str,
+) -> None:
+    """Vectorized sampled windows must preserve the original semantics."""
+    env = _build_scenario_env(scenario_name)
+    env.reset_episode()
+
+    expected = _sequential_connection_windows(env)
+
+    assert env.connection_windows.keys() == expected.keys()
+    for pair, expected_window in expected.items():
+        assert env.connection_windows[pair] == pytest.approx(
+            expected_window, abs=1e-12
+        )
+
+
+@pytest.mark.parametrize(
+    ("device_location", "device_direction", "server_location", "radius"),
+    [
+        ([-0.5, 0.0], [1.0, 0.0], [0.0, 0.0], 0.25),
+        ([0.0, 0.0], [1.0, 0.0], [5.0, 0.0], 0.1),
+        ([0.0, 0.0], [1.0, 0.0], [0.0, 0.0], 10.0),
+    ],
+)
+def test_vectorized_connection_window_boundary_cases_match_reference(
+    device_location: list,
+    device_direction: list,
+    server_location: list,
+    radius: float,
+) -> None:
+    """Boundary, disconnected, and full-horizon links must remain equivalent."""
+    env = _build_env(server_location=np.asarray(server_location, dtype=float))
+    env.devices[0].location = np.asarray(device_location, dtype=float)
+    env.devices[0].direction = np.asarray(device_direction, dtype=float)
+    env.servers[0].coverage_radius = radius
+    env._connection_window_cache_key = None
+
+    expected = _sequential_connection_windows(env)
+    env._update_connection_windows()
+
+    for pair, expected_window in expected.items():
+        assert env.connection_windows[pair] == pytest.approx(
+            expected_window, abs=1e-12
+        )
+
+
+def test_duplicate_connection_window_request_uses_cached_result() -> None:
+    """An unchanged slot and mobility state should not rescan all samples."""
+    env = _build_scenario_env("paper_10d_3s")
+    env.reset_episode()
+    first_metrics = env.get_runtime_metrics()
+    first_windows = dict(env.connection_windows)
+
+    env._update_connection_windows()
+    second_metrics = env.get_runtime_metrics()
+
+    assert env.connection_windows == first_windows
+    assert second_metrics["connection_window_requests"] == pytest.approx(
+        first_metrics["connection_window_requests"] + 1.0
+    )
+    assert second_metrics["connection_window_updates"] == pytest.approx(
+        first_metrics["connection_window_updates"]
+    )
+    assert second_metrics["connection_window_samples"] == pytest.approx(
+        first_metrics["connection_window_samples"]
+    )
+
+
+def test_slot_transition_invalidates_connection_window_cache() -> None:
+    """Moving devices to a new slot must compute fresh connection windows."""
+    env = _build_scenario_env("paper_10d_3s")
+    task_dags = {}
+    priorities = {}
+    for device in env.devices:
+        task_dag = TaskDAG(task_id=device.id, t_max=1.0, e_max=1.0)
+        task_dag.add_subtask(
+            Subtask(1, cpu_cycles=1e6, data_size=1e5, result_size=1e4)
+        )
+        task_dags[device.id] = task_dag
+        priorities[device.id] = [1]
+
+    env.reset_episode()
+    env.start_time_slot(task_dags, priorities)
+    metrics_before_step = env.get_runtime_metrics()
+    env.step([0] * len(env.devices))
+    metrics_after_step = env.get_runtime_metrics()
+
+    assert metrics_before_step["connection_window_requests"] == pytest.approx(2.0)
+    assert metrics_before_step["connection_window_updates"] == pytest.approx(1.0)
+    assert metrics_after_step["connection_window_requests"] == pytest.approx(3.0)
+    assert metrics_after_step["connection_window_updates"] == pytest.approx(2.0)
+    assert metrics_after_step["joint_state_calls"] == pytest.approx(2.0)

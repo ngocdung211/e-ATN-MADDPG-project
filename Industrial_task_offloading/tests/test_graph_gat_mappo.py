@@ -3,7 +3,9 @@
 import pathlib
 import sys
 
+import pytest
 import torch
+from torch.distributions import Categorical
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -13,6 +15,7 @@ from run_comparision import (
     _collect_graph_gat_actions,
     _update_graph_gat_mappo_from_rollout,
     build_algorithm_configs,
+    select_algorithm_configs,
 )
 from utils.topology_graph_state import build_topology_graph_state
 
@@ -83,6 +86,44 @@ def _parameters_changed(before, after) -> bool:
     return any(not torch.allclose(old, new) for old, new in zip(before, after))
 
 
+def _encode_sequential_local_embeddings(
+    agent: GraphGATMAPPOAgent, graph_state
+) -> torch.Tensor:
+    """Encode local graphs through the original sequential reference path."""
+    embeddings = []
+    for device_index in range(agent.num_devices):
+        local_graph = agent._local_subgraph_for_device(graph_state, device_index)
+        embeddings.append(
+            agent.encoder(
+                local_graph.node_features,
+                local_graph.edge_index,
+                local_graph.edge_features,
+                local_graph.device_node_indices,
+            )[0]
+        )
+    return torch.stack(embeddings)
+
+
+def _policy_and_values_sequential_reference(
+    agent: GraphGATMAPPOAgent, graph_states, actions: torch.Tensor
+):
+    """Evaluate rollout graphs through the previous transition loop."""
+    log_prob_rows = []
+    entropy_rows = []
+    value_rows = []
+    for graph_index, graph_state in enumerate(graph_states):
+        probabilities = agent._actor_probabilities_for_graph_state(graph_state)
+        distribution = Categorical(probabilities)
+        log_prob_rows.append(distribution.log_prob(actions[graph_index]))
+        entropy_rows.append(distribution.entropy())
+        value_rows.append(agent.critic(agent._encode_graph(graph_state)))
+    return (
+        torch.stack(log_prob_rows),
+        torch.stack(entropy_rows).mean(),
+        torch.cat(value_rows),
+    )
+
+
 def test_graph_gat_mappo_samples_valid_actions_from_graph_state() -> None:
     """Graph-GAT MAPPO should sample one valid offloading action per device."""
     torch.manual_seed(31)
@@ -100,6 +141,63 @@ def test_graph_gat_mappo_samples_valid_actions_from_graph_state() -> None:
     assert len(log_probs) == 2
     assert all(0 <= action < agent.action_dim for action in actions)
     assert all(isinstance(log_prob, float) for log_prob in log_probs)
+
+
+def test_graph_gat_mappo_cpu_device_keeps_modules_and_outputs_on_cpu() -> None:
+    """CPU mode should keep model computation on the control device."""
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+        device="cpu",
+    )
+    graph_state = _make_graph_state()
+
+    probabilities = agent._actor_probabilities_for_graph_state(graph_state)
+    values = agent._values_for_graphs([graph_state])
+
+    assert agent.device == torch.device("cpu")
+    assert next(agent.encoder.parameters()).device.type == "cpu"
+    assert next(agent.actor.parameters()).device.type == "cpu"
+    assert next(agent.critic.parameters()).device.type == "cpu"
+    assert probabilities.device.type == "cpu"
+    assert values.device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_graph_gat_mappo_cuda_smoke_update() -> None:
+    """CUDA mode should select actions and complete one rollout update."""
+    torch.manual_seed(47)
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+        ppo_epochs=1,
+        device="cuda",
+    )
+    buffer = GraphGATRolloutBuffer()
+    for step_index in range(2):
+        graph_state = _make_graph_state(offset=0.05 * step_index)
+        actions, old_log_probs = agent.select_actions_with_log_probs(graph_state)
+        buffer.push(
+            graph_state=graph_state,
+            actions=actions,
+            rewards=[1.0, 0.5],
+            next_graph_state=_make_graph_state(offset=0.05 * (step_index + 1)),
+            old_log_probs=old_log_probs,
+            done=step_index == 1,
+        )
+
+    agent.update_from_rollout(buffer)
+    agent.synchronize_device()
+
+    assert agent.device.type == "cuda"
+    assert next(agent.encoder.parameters()).device.type == "cuda"
+    assert len(buffer) == 0
 
 
 def test_graph_gat_mappo_masks_disconnected_server_actions() -> None:
@@ -193,6 +291,170 @@ def test_graph_gat_mappo_actor_uses_local_subgraph_embeddings() -> None:
     assert torch.allclose(base_probabilities[0], changed_probabilities[0], atol=1e-6)
 
 
+def test_batched_local_embeddings_match_sequential_reference() -> None:
+    """Batched local encoding should preserve the previous graph calculation."""
+    torch.manual_seed(36)
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    graph_state = _make_graph_state()
+    sequential_embeddings = _encode_sequential_local_embeddings(
+        agent, graph_state
+    )
+
+    batched_embeddings = agent._encode_local_actor_embeddings(graph_state)
+
+    assert torch.allclose(batched_embeddings, sequential_embeddings, atol=1e-6)
+
+
+def test_batched_local_encoder_gradients_match_sequential_reference() -> None:
+    """Batched local encoding should preserve encoder training gradients."""
+    torch.manual_seed(38)
+    sequential_agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    batched_agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    batched_agent.encoder.load_state_dict(sequential_agent.encoder.state_dict())
+    graph_state = _make_graph_state()
+
+    sequential_embeddings = _encode_sequential_local_embeddings(
+        sequential_agent, graph_state
+    )
+    sequential_embeddings.pow(2).mean().backward()
+
+    batched_embeddings = batched_agent._encode_local_actor_embeddings(graph_state)
+    batched_embeddings.pow(2).mean().backward()
+
+    for sequential_parameter, batched_parameter in zip(
+        sequential_agent.encoder.parameters(), batched_agent.encoder.parameters()
+    ):
+        assert torch.allclose(
+            sequential_parameter.grad, batched_parameter.grad, atol=1e-6
+        )
+
+
+def test_batched_global_critic_value_matches_graph_reference() -> None:
+    """Vectorized global topology should preserve centralized critic values."""
+    torch.manual_seed(39)
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    graph_state = _make_graph_state()
+    reference_embeddings = agent.encoder(
+        graph_state.node_features,
+        graph_state.edge_index,
+        graph_state.edge_features,
+        graph_state.device_node_indices,
+    )
+
+    reference_value = agent.critic(reference_embeddings)
+    batched_value = agent.critic(agent._encode_graph(graph_state))
+
+    assert torch.allclose(batched_value, reference_value, atol=1e-6)
+
+
+def test_batched_rollout_policy_and_values_match_sequential_reference() -> None:
+    """Time-batched PPO evaluation should preserve policy and critic outputs."""
+    torch.manual_seed(40)
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    graph_states = [
+        _make_graph_state(offset=0.05 * step_index) for step_index in range(4)
+    ]
+    actions = torch.tensor([[0, 2], [1, 0], [0, 2], [1, 0]])
+
+    reference = _policy_and_values_sequential_reference(
+        agent, graph_states, actions
+    )
+    batched = agent._policy_and_values_for_graphs(graph_states, actions)
+
+    for batched_value, reference_value in zip(batched, reference):
+        assert torch.allclose(batched_value, reference_value, atol=1e-6)
+
+
+def test_batched_rollout_gradients_match_sequential_reference() -> None:
+    """Time-batched PPO evaluation should preserve training gradients."""
+    torch.manual_seed(42)
+    sequential_agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    batched_agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+    )
+    for sequential_module, batched_module in (
+        (sequential_agent.encoder, batched_agent.encoder),
+        (sequential_agent.actor, batched_agent.actor),
+        (sequential_agent.critic, batched_agent.critic),
+    ):
+        batched_module.load_state_dict(sequential_module.state_dict())
+    graph_states = [
+        _make_graph_state(offset=0.05 * step_index) for step_index in range(4)
+    ]
+    actions = torch.tensor([[0, 2], [1, 0], [0, 2], [1, 0]])
+
+    sequential_outputs = _policy_and_values_sequential_reference(
+        sequential_agent, graph_states, actions
+    )
+    sequential_loss = (
+        sequential_outputs[0].pow(2).mean()
+        + sequential_outputs[1]
+        + sequential_outputs[2].pow(2).mean()
+    )
+    sequential_loss.backward()
+    batched_outputs = batched_agent._policy_and_values_for_graphs(
+        graph_states, actions
+    )
+    batched_loss = (
+        batched_outputs[0].pow(2).mean()
+        + batched_outputs[1]
+        + batched_outputs[2].pow(2).mean()
+    )
+    batched_loss.backward()
+
+    for sequential_module, batched_module in (
+        (sequential_agent.encoder, batched_agent.encoder),
+        (sequential_agent.actor, batched_agent.actor),
+        (sequential_agent.critic, batched_agent.critic),
+    ):
+        for sequential_parameter, batched_parameter in zip(
+            sequential_module.parameters(), batched_module.parameters()
+        ):
+            assert torch.allclose(
+                sequential_parameter.grad, batched_parameter.grad, atol=1e-6
+            )
+
+
 def test_graph_gat_rollout_buffer_keeps_graph_transitions() -> None:
     """Graph-GAT rollout buffer should keep graph states and PPO metadata."""
     buffer = GraphGATRolloutBuffer()
@@ -224,6 +486,7 @@ def test_graph_gat_mappo_update_changes_actor_critic_and_gat_parameters() -> Non
         edge_feature_dim=7,
         embedding_dim=8,
         ppo_epochs=2,
+        max_grad_norm=0.5,
     )
     buffer = GraphGATRolloutBuffer()
     for step_index in range(4):
@@ -269,6 +532,91 @@ def test_graph_gat_mappo_is_registered_as_separate_comparison_model() -> None:
         assert configs["Mask-MAPPO"]["class"] is not GraphGATMAPPOAgent
 
 
+def test_graph_gat_device_override_only_applies_to_graph_agents() -> None:
+    """Comparison config should route the device override to Graph-GAT only."""
+    configs = build_algorithm_configs(graph_gat_device="cpu")
+
+    for config in configs.values():
+        kwargs = config["kwargs"]
+        if config["class"] is GraphGATMAPPOAgent:
+            assert kwargs["device"] == "cpu"
+        else:
+            assert "device" not in kwargs
+
+
+def test_graph_gat_hyperparameter_overrides_are_scoped_to_graph_variants() -> None:
+    """CLI tuning values should not change flat MAPPO configurations."""
+    configs = build_algorithm_configs(
+        graph_gat_lr=8e-5,
+        graph_gat_encoder_lr=3e-5,
+        graph_gat_clip_param=0.15,
+        graph_gat_entropy_coef=0.005,
+        graph_gat_value_loss_coef=0.5,
+        graph_gat_max_grad_norm=0.5,
+        graph_gat_warmup_episodes=20,
+        graph_gat_warmup_updates_per_step=2,
+        graph_gat_warmup_lr=3e-4,
+    )
+
+    for algorithm_name, config in configs.items():
+        kwargs = config["kwargs"]
+        if config["class"] is not GraphGATMAPPOAgent:
+            assert "encoder_lr" not in kwargs
+            assert "entropy_coef" not in kwargs
+            continue
+        assert kwargs["lr"] == 8e-5
+        assert kwargs["encoder_lr"] == 3e-5
+        assert kwargs["clip_param"] == 0.15
+        assert kwargs["entropy_coef"] == 0.005
+        assert kwargs["value_loss_coef"] == 0.5
+        assert kwargs["max_grad_norm"] == 0.5
+        if "Warmup" in algorithm_name:
+            assert kwargs["topology_warmup_episodes"] == 20
+            assert kwargs["topology_warmup_updates_per_step"] == 2
+            assert kwargs["topology_warmup_lr"] == 3e-4
+        else:
+            assert "topology_warmup_episodes" not in kwargs
+
+
+def test_graph_gat_optimizer_supports_encoder_specific_learning_rate() -> None:
+    """Encoder and policy heads should use their configured PPO rates."""
+    agent = GraphGATMAPPOAgent(
+        num_devices=2,
+        num_servers=2,
+        node_feature_dim=14,
+        edge_feature_dim=7,
+        embedding_dim=8,
+        lr=8e-5,
+        encoder_lr=3e-5,
+        entropy_coef=0.005,
+        value_loss_coef=0.5,
+        max_grad_norm=0.5,
+    )
+
+    assert [group["lr"] for group in agent.optimizer.param_groups] == [3e-5, 8e-5]
+    assert agent.entropy_coef == 0.005
+    assert agent.value_loss_coef == 0.5
+    assert agent.max_grad_norm == 0.5
+
+
+def test_algorithm_selection_runs_only_requested_models_in_order() -> None:
+    """Targeted speed tests should avoid rerunning the full ablation matrix."""
+    configs = build_algorithm_configs(graph_gat_device="cpu")
+
+    selected = select_algorithm_configs(
+        configs, ["Graph-GAT MAPPO", "Local Only"]
+    )
+
+    assert list(selected) == ["Graph-GAT MAPPO", "Local Only"]
+    assert selected["Graph-GAT MAPPO"] is configs["Graph-GAT MAPPO"]
+
+
+def test_algorithm_selection_rejects_unknown_name() -> None:
+    """A typo in a targeted benchmark must fail before training starts."""
+    with pytest.raises(ValueError, match="unknown algorithm"):
+        select_algorithm_configs(build_algorithm_configs(), ["Graph GAT"])
+
+
 def test_collect_graph_gat_actions_builds_graph_from_joint_state() -> None:
     """Comparison loop should collect Graph-GAT actions from topology graph state."""
     torch.manual_seed(41)
@@ -287,6 +635,8 @@ def test_collect_graph_gat_actions_builds_graph_from_joint_state() -> None:
         old_log_probs,
         graph_state,
         graph_build_time,
+        graph_warmup_time,
+        graph_warmup_loss,
         graph_action_time,
     ) = (
         _collect_graph_gat_actions(
@@ -294,6 +644,7 @@ def test_collect_graph_gat_actions_builds_graph_from_joint_state() -> None:
             joint_state=_make_joint_state(),
             num_devices=2,
             num_servers=2,
+            episode_index=0,
         )
     )
 
@@ -303,6 +654,8 @@ def test_collect_graph_gat_actions_builds_graph_from_joint_state() -> None:
     assert graph_state.node_features.shape == (4, 14)
     assert all(0 <= action < agent.action_dim for action in actions)
     assert graph_build_time >= 0.0
+    assert graph_warmup_time == 0.0
+    assert graph_warmup_loss == 0.0
     assert graph_action_time >= 0.0
 
 
@@ -338,8 +691,8 @@ def test_graph_gat_rollout_update_helper_updates_agent_and_clears_buffer() -> No
     assert update_time >= 0.0
 
 
-def test_graph_gat_mappo_encodes_local_actor_and_global_critic_graphs() -> None:
-    """PPO update should encode local actor graphs and one global critic graph."""
+def test_graph_gat_mappo_batches_rollout_encoder_calls() -> None:
+    """PPO should use one local/global encoder call per rollout evaluation."""
     agent = GraphGATMAPPOAgent(
         num_devices=2,
         num_servers=2,
@@ -359,19 +712,27 @@ def test_graph_gat_mappo_encodes_local_actor_and_global_critic_graphs() -> None:
             old_log_probs=[-0.5, -0.5],
             done=step_index == transition_count - 1,
         )
-    original_encode_graph = agent._encode_graph
-    encode_call_count = 0
+    original_global_rollout = agent.encoder.forward_batched_global_rollout
+    original_local_rollout = agent.encoder.forward_batched_local_rollout
+    global_encode_call_count = 0
+    local_batch_call_count = 0
 
-    def counted_encode_graph(graph_state):
-        nonlocal encode_call_count
-        encode_call_count += 1
-        return original_encode_graph(graph_state)
+    def counted_global_rollout(*args, **kwargs):
+        nonlocal global_encode_call_count
+        global_encode_call_count += 1
+        return original_global_rollout(*args, **kwargs)
 
-    agent._encode_graph = counted_encode_graph
+    def counted_local_rollout(*args, **kwargs):
+        nonlocal local_batch_call_count
+        local_batch_call_count += 1
+        return original_local_rollout(*args, **kwargs)
+
+    agent.encoder.forward_batched_global_rollout = counted_global_rollout
+    agent.encoder.forward_batched_local_rollout = counted_local_rollout
 
     agent.update_from_rollout(buffer)
 
-    expected_encode_calls = transition_count * (
-        2 + agent.ppo_epochs * (agent.num_devices + 1)
-    )
-    assert encode_call_count == expected_encode_calls
+    expected_global_calls = 2 + agent.ppo_epochs
+    expected_local_batch_calls = agent.ppo_epochs
+    assert global_encode_call_count == expected_global_calls
+    assert local_batch_call_count == expected_local_batch_calls

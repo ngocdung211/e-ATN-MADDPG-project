@@ -35,13 +35,17 @@ from utils.comparison_outputs import (
     flatten_topology_metrics,
     save_comparison_outputs,
 )
-from utils.gcn_training import load_or_train_priority_model
+from utils.priority_model_training import load_or_train_priority_model
 from utils.experiment_setup import (
     build_priorities,
     build_task_priority_model,
     generate_task_dags_for_episode,
     get_priority_checkpoint_path,
-    make_gcn_dag_sampler,
+    make_priority_dag_sampler,
+)
+from utils.experiment_tracking import (
+    ExperimentTracker,
+    initialize_experiment_tracker,
 )
 from utils.paper_config import PAPER_PARAMS
 from utils.topology_graph_state import TopologyGraphState, build_topology_graph_state
@@ -63,7 +67,6 @@ FIXED_BASELINE_ALGORITHMS = frozenset(
         "Random Offloading",
     }
 )
-
 
 def set_seed(seed: int = 42) -> None:
     """Set random seeds for reproducible runs.
@@ -102,6 +105,104 @@ def parse_args() -> argparse.Namespace:
         "--note",
         default="",
         help="Short experiment note stored in outputs and appended to the output folder.",
+    )
+    parser.add_argument(
+        "--graph-gat-device",
+        default=None,
+        help="Override Graph-GAT device: auto, cpu, cuda, or cuda:<index>.",
+    )
+    parser.add_argument(
+        "--graph-gat-lr", type=float, default=None, help="Actor/critic learning rate."
+    )
+    parser.add_argument(
+        "--graph-gat-encoder-lr",
+        type=float,
+        default=None,
+        help="Optional encoder-specific PPO learning rate.",
+    )
+    parser.add_argument(
+        "--graph-gat-hidden-dim", type=int, default=None, help="Hidden layer width."
+    )
+    parser.add_argument(
+        "--graph-gat-embedding-dim",
+        type=int,
+        default=None,
+        help="Topology embedding width.",
+    )
+    parser.add_argument(
+        "--graph-gat-clip-param", type=float, default=None, help="PPO clip range."
+    )
+    parser.add_argument(
+        "--graph-gat-ppo-epochs",
+        type=int,
+        default=None,
+        help="PPO passes per episode rollout.",
+    )
+    parser.add_argument(
+        "--graph-gat-entropy-coef",
+        type=float,
+        default=None,
+        help="Policy entropy bonus coefficient.",
+    )
+    parser.add_argument(
+        "--graph-gat-value-loss-coef",
+        type=float,
+        default=None,
+        help="Critic loss coefficient.",
+    )
+    parser.add_argument(
+        "--graph-gat-max-grad-norm",
+        type=float,
+        default=None,
+        help="Optional PPO gradient clipping norm.",
+    )
+    parser.add_argument(
+        "--graph-gat-warmup-episodes",
+        type=int,
+        default=None,
+        help="Warmup duration for Graph-GAT Warmup variants.",
+    )
+    parser.add_argument(
+        "--graph-gat-warmup-updates-per-step",
+        type=int,
+        default=None,
+        help="Auxiliary topology updates per step during warmup.",
+    )
+    parser.add_argument(
+        "--graph-gat-warmup-lr",
+        type=float,
+        default=None,
+        help="Auxiliary topology-warmup learning rate.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        default=str(provisional["wandb_mode"]),
+        choices=("disabled", "online", "offline"),
+        help="W&B tracking mode. Disabled by default.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default=str(provisional["wandb_project"]),
+        help="W&B project name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        default=str(provisional["wandb_entity"]),
+        help="Optional W&B user or team entity.",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        default="",
+        help="Optional group shared by all algorithm runs in this comparison.",
+    )
+    parser.add_argument(
+        "--algorithms",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional exact algorithm names to run, for example "
+            "--algorithms \"Graph-GAT MAPPO\". Default: run all configured algorithms."
+        ),
     )
     return parser.parse_args()
 
@@ -157,15 +258,49 @@ def build_devices_for_scenario(
     return devices
 
 
-def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
+def build_algorithm_configs(
+    graph_gat_device: Optional[str] = None,
+    *,
+    graph_gat_lr: Optional[float] = None,
+    graph_gat_encoder_lr: Optional[float] = None,
+    graph_gat_hidden_dim: Optional[int] = None,
+    graph_gat_embedding_dim: Optional[int] = None,
+    graph_gat_clip_param: Optional[float] = None,
+    graph_gat_ppo_epochs: Optional[int] = None,
+    graph_gat_entropy_coef: Optional[float] = None,
+    graph_gat_value_loss_coef: Optional[float] = None,
+    graph_gat_max_grad_norm: Optional[float] = None,
+    graph_gat_warmup_episodes: Optional[int] = None,
+    graph_gat_warmup_updates_per_step: Optional[int] = None,
+    graph_gat_warmup_lr: Optional[float] = None,
+) -> Dict[str, Dict[str, object]]:
     """Build algorithm configurations for DRL and simple baselines.
+
+    Args:
+        graph_gat_device: Optional device override applied only to Graph-GAT
+            MAPPO variants.
+        graph_gat_lr: Optional actor/critic learning-rate override.
+        graph_gat_encoder_lr: Optional encoder learning-rate override.
+        graph_gat_hidden_dim: Optional hidden-width override.
+        graph_gat_embedding_dim: Optional topology-embedding-width override.
+        graph_gat_clip_param: Optional PPO clip-range override.
+        graph_gat_ppo_epochs: Optional PPO update-epoch override.
+        graph_gat_entropy_coef: Optional entropy-coefficient override.
+        graph_gat_value_loss_coef: Optional critic-loss-coefficient override.
+        graph_gat_max_grad_norm: Optional PPO gradient-norm override.
+        graph_gat_warmup_episodes: Optional warmup-duration override.
+        graph_gat_warmup_updates_per_step: Optional warmup update-rate override.
+        graph_gat_warmup_lr: Optional warmup learning-rate override.
 
     Returns:
         Mapping from display name to agent class and constructor kwargs.
     """
     confirmed = PAPER_PARAMS["confirmed"]
     provisional = PAPER_PARAMS["provisional_table2_needed"]
-    return {
+    selected_graph_gat_device = graph_gat_device or str(
+        provisional["graph_gat_device"]
+    )
+    configs = {
         "Local Only": {"class": LocalOnlyAgent, "kwargs": {}},
         "Edge Only": {"class": EdgeOnlyAgent, "kwargs": {}},
         # "Feature Extraction Edge": {"class": FeatureExtractionEdgeAgent, "kwargs": {}},
@@ -222,7 +357,11 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
                 "clip_param": provisional["graph_gat_clip_param"],
                 "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+                "entropy_coef": provisional["graph_gat_entropy_coef"],
+                "value_loss_coef": provisional["graph_gat_value_loss_coef"],
+                "max_grad_norm": provisional["graph_gat_max_grad_norm"],
                 "use_action_mask": False,
+                "device": selected_graph_gat_device,
             },
         },
         "Graph-GAT Warmup MAPPO": {
@@ -234,6 +373,9 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
                 "clip_param": provisional["graph_gat_clip_param"],
                 "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+                "entropy_coef": provisional["graph_gat_entropy_coef"],
+                "value_loss_coef": provisional["graph_gat_value_loss_coef"],
+                "max_grad_norm": provisional["graph_gat_max_grad_norm"],
                 "use_action_mask": False,
                 "topology_warmup_episodes": int(
                     provisional["graph_gat_topology_warmup_episodes"]
@@ -242,6 +384,7 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                     provisional["graph_gat_topology_warmup_updates_per_step"]
                 ),
                 "topology_warmup_lr": provisional["graph_gat_topology_warmup_lr"],
+                "device": selected_graph_gat_device,
             },
         },
         "Graph-GAT Mask MAPPO": {
@@ -253,7 +396,11 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
                 "clip_param": provisional["graph_gat_clip_param"],
                 "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+                "entropy_coef": provisional["graph_gat_entropy_coef"],
+                "value_loss_coef": provisional["graph_gat_value_loss_coef"],
+                "max_grad_norm": provisional["graph_gat_max_grad_norm"],
                 "use_action_mask": provisional["graph_gat_use_action_mask"],
+                "device": selected_graph_gat_device,
             },
         },
         "Graph-GAT Warmup Mask MAPPO": {
@@ -265,6 +412,9 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                 "embedding_dim": int(provisional["graph_gat_embedding_dim"]),
                 "clip_param": provisional["graph_gat_clip_param"],
                 "ppo_epochs": int(provisional["graph_gat_ppo_epochs"]),
+                "entropy_coef": provisional["graph_gat_entropy_coef"],
+                "value_loss_coef": provisional["graph_gat_value_loss_coef"],
+                "max_grad_norm": provisional["graph_gat_max_grad_norm"],
                 "use_action_mask": provisional["graph_gat_use_action_mask"],
                 "topology_warmup_episodes": int(
                     provisional["graph_gat_topology_warmup_episodes"]
@@ -273,10 +423,70 @@ def build_algorithm_configs() -> Dict[str, Dict[str, object]]:
                     provisional["graph_gat_topology_warmup_updates_per_step"]
                 ),
                 "topology_warmup_lr": provisional["graph_gat_topology_warmup_lr"],
+                "device": selected_graph_gat_device,
             },
         },
 
     }
+    graph_overrides = {
+        "lr": graph_gat_lr,
+        "encoder_lr": graph_gat_encoder_lr,
+        "hidden_dim": graph_gat_hidden_dim,
+        "embedding_dim": graph_gat_embedding_dim,
+        "clip_param": graph_gat_clip_param,
+        "ppo_epochs": graph_gat_ppo_epochs,
+        "entropy_coef": graph_gat_entropy_coef,
+        "value_loss_coef": graph_gat_value_loss_coef,
+        "max_grad_norm": graph_gat_max_grad_norm,
+    }
+    selected_graph_overrides = {
+        key: value for key, value in graph_overrides.items() if value is not None
+    }
+    warmup_overrides = {
+        "topology_warmup_episodes": graph_gat_warmup_episodes,
+        "topology_warmup_updates_per_step": graph_gat_warmup_updates_per_step,
+        "topology_warmup_lr": graph_gat_warmup_lr,
+    }
+    selected_warmup_overrides = {
+        key: value for key, value in warmup_overrides.items() if value is not None
+    }
+    for algorithm_name, config in configs.items():
+        if config["class"] is not GraphGATMAPPOAgent:
+            continue
+        config["kwargs"].update(selected_graph_overrides)
+        if "Warmup" in algorithm_name:
+            config["kwargs"].update(selected_warmup_overrides)
+    return configs
+
+
+def select_algorithm_configs(
+    algorithm_configs: Dict[str, Dict[str, object]],
+    requested_algorithms: Optional[Sequence[str]],
+) -> Dict[str, Dict[str, object]]:
+    """Return requested algorithm configs while preserving requested order.
+
+    Args:
+        algorithm_configs: All configured algorithms keyed by display name.
+        requested_algorithms: Optional exact names requested by the CLI.
+
+    Returns:
+        Selected algorithm configuration mapping.
+
+    Raises:
+        ValueError: If any requested algorithm name is not configured.
+    """
+    if not requested_algorithms:
+        return algorithm_configs
+    unknown_algorithms = [
+        name for name in requested_algorithms if name not in algorithm_configs
+    ]
+    if unknown_algorithms:
+        valid_names = ", ".join(algorithm_configs)
+        unknown_names = ", ".join(unknown_algorithms)
+        raise ValueError(
+            f"unknown algorithm(s): {unknown_names}. Valid algorithms: {valid_names}"
+        )
+    return {name: algorithm_configs[name] for name in requested_algorithms}
 
 
 def _episodes_for_algorithm(algo_name: str, full_episodes: int, baseline_episodes: int) -> int:
@@ -385,14 +595,18 @@ def _collect_graph_gat_actions(
     graph_warmup_time = 0.0
     graph_warmup_loss = 0.0
     if agent.should_warmup_topology(episode_index):
+        agent.synchronize_device()
         graph_warmup_start = time.perf_counter()
         graph_warmup_loss = agent.warmup_topology_encoder(
             graph_state, agent.topology_warmup_updates_per_step
         )
+        agent.synchronize_device()
         graph_warmup_time = time.perf_counter() - graph_warmup_start
 
+    agent.synchronize_device()
     graph_action_start = time.perf_counter()
     joint_actions, old_log_probs = agent.select_actions_with_log_probs(graph_state)
+    agent.synchronize_device()
     graph_action_time = time.perf_counter() - graph_action_start
     local_count = sum(1 for action in joint_actions if action == 0)
     edge_count = len(joint_actions) - local_count
@@ -497,6 +711,22 @@ def _format_diagnostic_summary(algo_name: str, episode_number: int, history: Dic
             f"action={graph_action_time:.3f}s update={graph_update_time:.3f}s "
             f"transitions={graph_transition_count:.0f}"
         )
+    runtime_env_step = history.get("runtime_env_step_time", [0.0])[-1]
+    runtime_windows = history.get("runtime_connection_window_time", [0.0])[-1]
+    runtime_unaccounted = history.get("runtime_unaccounted_time", [0.0])[-1]
+    if runtime_env_step > 0.0 or runtime_windows > 0.0:
+        window_requests = history.get(
+            "runtime_connection_window_requests", [0.0]
+        )[-1]
+        window_updates = history.get(
+            "runtime_connection_window_updates", [0.0]
+        )[-1]
+        summary += (
+            f"\n  Wall-clock cost:   env_step={runtime_env_step:.3f}s "
+            f"windows={runtime_windows:.3f}s "
+            f"requests/updates={window_requests:.0f}/{window_updates:.0f} "
+            f"unaccounted={runtime_unaccounted:.3f}s"
+        )
     return summary
 
 
@@ -507,6 +737,99 @@ def _should_print_diagnostics(episode_number: int, num_episodes: int) -> bool:
     return episode_number == num_episodes or (
         interval > 0 and episode_number % interval == 0
     )
+
+
+def _build_episode_tracking_metrics(
+    history: Dict[str, List[float]],
+    episode_number: int,
+    num_episodes: int,
+    episode_elapsed_seconds: float,
+    total_elapsed_seconds: float,
+    graph_gat_agent: Optional[GraphGATMAPPOAgent] = None,
+) -> Dict[str, float]:
+    """Build one complete W&B record from the latest episode metrics."""
+    def latest(key: str) -> float:
+        """Return the latest history value, or zero for optional metrics."""
+        return float(history.get(key, [0.0])[-1])
+
+    progress_fraction = episode_number / max(num_episodes, 1)
+    average_episode_seconds = total_elapsed_seconds / max(episode_number, 1)
+    eta_seconds = average_episode_seconds * max(num_episodes - episode_number, 0)
+    metrics = {
+        "episode": float(episode_number),
+        "training/progress_percent": progress_fraction * 100.0,
+        "training/episode_seconds": episode_elapsed_seconds,
+        "training/elapsed_seconds": total_elapsed_seconds,
+        "training/eta_seconds": eta_seconds,
+        "performance/reward": history["reward"][-1],
+        "performance/delay_seconds": history["delay"][-1],
+        "performance/energy_joules": history["energy"][-1],
+        "actions/local_ratio_percent": history["local_ratio"][-1],
+        "actions/edge_ratio_percent": history["edge_ratio"][-1],
+        "actions/requested_local_count": history["requested_local_count"][-1],
+        "actions/requested_edge_count": history["requested_edge_count"][-1],
+        "actions/resolved_local_count": history["resolved_local_count"][-1],
+        "actions/resolved_edge_count": history["resolved_edge_count"][-1],
+        "execution/local_seconds": history["local_time"][-1],
+        "execution/server_seconds": history["server_time"][-1],
+        "execution/transfer_seconds": history["transfer_time"][-1],
+        "execution/wait_seconds": history["queue_or_wait_time"][-1],
+        "penalty/count": history["penalty_count"][-1],
+        "penalty/seconds": history["penalty_time"][-1],
+        "simulation/local_compute_seconds": history["local_time"][-1],
+        "simulation/edge_compute_seconds": history["server_time"][-1],
+        "simulation/transfer_seconds": history["transfer_time"][-1],
+        "simulation/queue_wait_seconds": history["queue_or_wait_time"][-1],
+        "simulation/penalty_seconds": history["penalty_time"][-1],
+        "graph/build_seconds": history["graph_build_time"][-1],
+        "graph/warmup_seconds": history["graph_warmup_time"][-1],
+        "graph/warmup_loss": history["graph_warmup_loss"][-1],
+        "graph/action_seconds": history["graph_action_time"][-1],
+        "graph/update_seconds": history["graph_update_time"][-1],
+        "graph/transition_count": history["graph_transition_count"][-1],
+        "runtime/dag_generation_seconds": latest("runtime_dag_generation_time"),
+        "runtime/priority_inference_seconds": latest("runtime_priority_inference_time"),
+        "runtime/start_slot_seconds": latest("runtime_start_slot_time"),
+        "runtime/action_collection_seconds": latest("runtime_action_collection_time"),
+        "runtime/env_step_seconds": latest("runtime_env_step_time"),
+        "runtime/metric_summary_seconds": latest("runtime_metric_summary_time"),
+        "runtime/rollout_storage_seconds": latest("runtime_rollout_storage_time"),
+        "runtime/model_update_seconds": latest("runtime_model_update_time"),
+        "runtime/connection_window_seconds": latest(
+            "runtime_connection_window_time"
+        ),
+        "runtime/connection_window_requests": latest(
+            "runtime_connection_window_requests"
+        ),
+        "runtime/connection_window_updates": latest(
+            "runtime_connection_window_updates"
+        ),
+        "runtime/connection_window_samples": latest(
+            "runtime_connection_window_samples"
+        ),
+        "runtime/joint_state_seconds": latest("runtime_joint_state_time"),
+        "runtime/accounted_seconds": latest("runtime_accounted_time"),
+        "runtime/unaccounted_seconds": latest("runtime_unaccounted_time"),
+    }
+    if graph_gat_agent is not None and graph_gat_agent.device.type == "cuda":
+        megabyte = 1024.0**2
+        metrics.update(
+            {
+                "gpu/memory_allocated_mb": torch.cuda.memory_allocated(
+                    graph_gat_agent.device
+                )
+                / megabyte,
+                "gpu/memory_reserved_mb": torch.cuda.memory_reserved(
+                    graph_gat_agent.device
+                )
+                / megabyte,
+                "gpu/max_memory_allocated_mb": torch.cuda.max_memory_allocated(
+                    graph_gat_agent.device
+                )
+                / megabyte,
+            }
+        )
+    return metrics
 
 
 def _update_agents_from_buffer(
@@ -609,8 +932,10 @@ def _update_graph_gat_mappo_from_rollout(
         return 0.0
 
     agent.gamma = gamma
+    agent.synchronize_device()
     update_start = time.perf_counter()
     agent.update_from_rollout(rollout_buffer)
+    agent.synchronize_device()
     return time.perf_counter() - update_start
 
 
@@ -627,6 +952,7 @@ def train_algorithm(
     topology_scenario: Optional[TopologyScenario] = None,
     topology_metrics: Optional[Dict[str, object]] = None,
     experiment_note: str = "",
+    experiment_tracker: Optional[ExperimentTracker] = None,
 ) -> Tuple[Dict[str, List[float]], Optional[Dict[str, Any]]]:
     """Train one algorithm configuration and return metrics and checkpoint.
 
@@ -643,6 +969,7 @@ def train_algorithm(
         topology_scenario: Optional named topology scenario for mobility routes.
         topology_metrics: Optional topology metrics stored in checkpoints.
         experiment_note: Optional note stored in checkpoint metadata.
+        experiment_tracker: Optional per-episode external metric tracker.
 
     Returns:
         Tuple of metric history and optional trainable model checkpoint payload.
@@ -696,6 +1023,7 @@ def train_algorithm(
                 **agent_config.get("kwargs", {}),
             )
         )
+        print(f"[{algo_name}] Graph-GAT device: {agents[0].device}")
     else:
         for _ in range(len(devices)):
             agent = agent_class(
@@ -740,10 +1068,28 @@ def train_algorithm(
         "graph_action_time": [],
         "graph_update_time": [],
         "graph_transition_count": [],
+        "runtime_dag_generation_time": [],
+        "runtime_priority_inference_time": [],
+        "runtime_start_slot_time": [],
+        "runtime_action_collection_time": [],
+        "runtime_env_step_time": [],
+        "runtime_metric_summary_time": [],
+        "runtime_rollout_storage_time": [],
+        "runtime_model_update_time": [],
+        "runtime_connection_window_time": [],
+        "runtime_connection_window_requests": [],
+        "runtime_connection_window_updates": [],
+        "runtime_connection_window_samples": [],
+        "runtime_joint_state_time": [],
+        "runtime_accounted_time": [],
+        "runtime_unaccounted_time": [],
+        "runtime_tracking_log_time": [],
     }
 
+    training_start_time = time.perf_counter()
     episode_iterator = trange(num_episodes, desc=f"Training {algo_name}", leave=True)
     for episode in episode_iterator:
+        episode_start_time = time.perf_counter()
         env.reset_episode()
         count_local = 0
         count_edge = 0
@@ -768,6 +1114,14 @@ def train_algorithm(
         episode_graph_action_time = 0.0
         episode_graph_update_time = 0.0
         episode_graph_transition_count = 0.0
+        episode_dag_generation_time = 0.0
+        episode_priority_inference_time = 0.0
+        episode_start_slot_time = 0.0
+        episode_action_collection_time = 0.0
+        episode_env_step_time = 0.0
+        episode_metric_summary_time = 0.0
+        episode_rollout_storage_time = 0.0
+        episode_model_update_time = 0.0
 
         episode_done = False
         for _ in range(time_slots):
@@ -779,17 +1133,28 @@ def train_algorithm(
             slot_steps = 0
             prev_delay_mean = np.mean(list(env.device_accumulated_delay.values()))
             prev_energy_mean = np.mean(list(env.device_accumulated_energy.values()))
+            dag_generation_start = time.perf_counter()
             task_dags = generate_task_dags_for_episode(
                 devices,
                 data_loader,
                 t_max=provisional["t_max"],
                 e_max=provisional["e_max"],
             )
+            episode_dag_generation_time += (
+                time.perf_counter() - dag_generation_start
+            )
+            priority_inference_start = time.perf_counter()
             priorities = build_priorities_by_mode(task_dags, priority_model, priority_mode)
+            episode_priority_inference_time += (
+                time.perf_counter() - priority_inference_start
+            )
 
+            start_slot_start = time.perf_counter()
             current_joint_state = env.start_time_slot(task_dags, priorities)
+            episode_start_slot_time += time.perf_counter() - start_slot_start
             slot_done = False
             while not slot_done and not episode_done:
+                action_collection_start = time.perf_counter()
                 if uses_graph_gat_mappo:
                     (
                         joint_actions,
@@ -818,13 +1183,24 @@ def train_algorithm(
                     joint_actions, local_count, edge_count = _collect_joint_actions(
                         agents, current_joint_state, env
                     )
+                episode_action_collection_time += (
+                    time.perf_counter() - action_collection_start
+                )
                 count_local += local_count
                 count_edge += edge_count
                 slot_local += local_count
                 slot_edge += edge_count
 
-                next_joint_state, joint_rewards, step_episode_done, info = env.step(joint_actions)
+                env_step_start = time.perf_counter()
+                next_joint_state, joint_rewards, step_episode_done, info = env.step(
+                    joint_actions
+                )
+                episode_env_step_time += time.perf_counter() - env_step_start
+                metric_summary_start = time.perf_counter()
                 metric_summary = _summarize_step_metrics(env.last_step_metrics)
+                episode_metric_summary_time += (
+                    time.perf_counter() - metric_summary_start
+                )
                 slot_done = info.get("slot_done", False)
                 episode_done = step_episode_done
                 # Aggregate team reward as average per-agent immediate reward.
@@ -842,6 +1218,7 @@ def train_algorithm(
                 slot_requested_edge_counts.append(metric_summary["requested_edge_count"])
                 slot_resolved_local_counts.append(metric_summary["resolved_local_count"])
                 slot_resolved_edge_counts.append(metric_summary["resolved_edge_count"])
+                rollout_storage_start = time.perf_counter()
                 if uses_graph_gat_mappo:
                     next_graph_build_start = time.perf_counter()
                     next_graph_state = build_topology_graph_state(
@@ -878,6 +1255,9 @@ def train_algorithm(
                     replay_buffer.push(
                         current_joint_state, joint_actions, joint_rewards, next_joint_state
                     )
+                episode_rollout_storage_time += (
+                    time.perf_counter() - rollout_storage_start
+                )
                 current_joint_state = next_joint_state
         
             total_slot_actions = slot_local + slot_edge
@@ -945,6 +1325,7 @@ def train_algorithm(
             episode_graph_update_time = _update_graph_gat_mappo_from_rollout(
                 agents[0], graph_rollout_buffer, gamma
             )
+            episode_model_update_time = episode_graph_update_time
         history["graph_build_time"].append(episode_graph_build_time)
         history["graph_warmup_time"].append(episode_graph_warmup_time)
         history["graph_warmup_loss"].append(
@@ -963,15 +1344,88 @@ def train_algorithm(
             penalty=f"{episode_penalty_count:.0f}",
         )
 
-        episode_number = episode + 1
-        if _should_print_diagnostics(episode_number, num_episodes):
-            episode_iterator.write(_format_diagnostic_summary(algo_name, episode_number, history))
-         
         # 4. Network Updates
+        model_update_start = time.perf_counter()
         if uses_rollout_buffer:
             _update_agents_from_rollout(agents, rollout_buffer, gamma)
         elif not uses_graph_gat_mappo:
             _update_agents_from_buffer(agents, replay_buffer, batch_size, gamma)
+        if not uses_graph_gat_mappo:
+            episode_model_update_time = time.perf_counter() - model_update_start
+
+        environment_runtime = env.get_runtime_metrics()
+        episode_accounted_time = sum(
+            [
+                episode_dag_generation_time,
+                episode_priority_inference_time,
+                episode_start_slot_time,
+                episode_action_collection_time,
+                episode_env_step_time,
+                episode_metric_summary_time,
+                episode_rollout_storage_time,
+                episode_model_update_time,
+            ]
+        )
+        episode_elapsed_before_tracking = time.perf_counter() - episode_start_time
+        episode_unaccounted_time = max(
+            0.0, episode_elapsed_before_tracking - episode_accounted_time
+        )
+        history["runtime_dag_generation_time"].append(episode_dag_generation_time)
+        history["runtime_priority_inference_time"].append(
+            episode_priority_inference_time
+        )
+        history["runtime_start_slot_time"].append(episode_start_slot_time)
+        history["runtime_action_collection_time"].append(
+            episode_action_collection_time
+        )
+        history["runtime_env_step_time"].append(episode_env_step_time)
+        history["runtime_metric_summary_time"].append(episode_metric_summary_time)
+        history["runtime_rollout_storage_time"].append(
+            episode_rollout_storage_time
+        )
+        history["runtime_model_update_time"].append(episode_model_update_time)
+        history["runtime_connection_window_time"].append(
+            environment_runtime["connection_window_seconds"]
+        )
+        history["runtime_connection_window_requests"].append(
+            environment_runtime["connection_window_requests"]
+        )
+        history["runtime_connection_window_updates"].append(
+            environment_runtime["connection_window_updates"]
+        )
+        history["runtime_connection_window_samples"].append(
+            environment_runtime["connection_window_samples"]
+        )
+        history["runtime_joint_state_time"].append(
+            environment_runtime["joint_state_seconds"]
+        )
+        history["runtime_accounted_time"].append(episode_accounted_time)
+        history["runtime_unaccounted_time"].append(episode_unaccounted_time)
+        history["runtime_tracking_log_time"].append(0.0)
+
+        episode_number = episode + 1
+        if _should_print_diagnostics(episode_number, num_episodes):
+            episode_iterator.write(
+                _format_diagnostic_summary(algo_name, episode_number, history)
+            )
+
+        if experiment_tracker is not None:
+            total_elapsed_seconds = time.perf_counter() - training_start_time
+            tracking_log_start = time.perf_counter()
+            experiment_tracker.log(
+                _build_episode_tracking_metrics(
+                    history=history,
+                    episode_number=episode_number,
+                    num_episodes=num_episodes,
+                    episode_elapsed_seconds=time.perf_counter() - episode_start_time,
+                    total_elapsed_seconds=total_elapsed_seconds,
+                    graph_gat_agent=agents[0] if uses_graph_gat_mappo else None,
+                ),
+                step=episode_number,
+            )
+            history["runtime_tracking_log_time"][-1] = (
+                time.perf_counter() - tracking_log_start
+            )
     
         if episode_number == 1 or _should_print_diagnostics(
             episode_number, num_episodes
@@ -1066,7 +1520,7 @@ if __name__ == "__main__":
         hidden_dim=int(confirmed["gcn_hidden_dim"]),
     )
     priority_ckpt_path = get_priority_checkpoint_path(priority_model_name)
-    sample_training_dag = make_gcn_dag_sampler(
+    sample_training_dag = make_priority_dag_sampler(
         data_loader,
         t_max=provisional["t_max"],
         e_max=provisional["e_max"],
@@ -1086,7 +1540,26 @@ if __name__ == "__main__":
     devices = build_devices_for_scenario(topology_scenario, confirmed, provisional)
 
     # 2. Define Algorithms to Compare
-    algorithms = build_algorithm_configs()
+    algorithms = select_algorithm_configs(
+        build_algorithm_configs(
+            args.graph_gat_device,
+            graph_gat_lr=args.graph_gat_lr,
+            graph_gat_encoder_lr=args.graph_gat_encoder_lr,
+            graph_gat_hidden_dim=args.graph_gat_hidden_dim,
+            graph_gat_embedding_dim=args.graph_gat_embedding_dim,
+            graph_gat_clip_param=args.graph_gat_clip_param,
+            graph_gat_ppo_epochs=args.graph_gat_ppo_epochs,
+            graph_gat_entropy_coef=args.graph_gat_entropy_coef,
+            graph_gat_value_loss_coef=args.graph_gat_value_loss_coef,
+            graph_gat_max_grad_norm=args.graph_gat_max_grad_norm,
+            graph_gat_warmup_episodes=args.graph_gat_warmup_episodes,
+            graph_gat_warmup_updates_per_step=(
+                args.graph_gat_warmup_updates_per_step
+            ),
+            graph_gat_warmup_lr=args.graph_gat_warmup_lr,
+        ),
+        args.algorithms,
+    )
 
     # 3. Run Comparisons
     results = {"reward": {}, "delay": {}, "energy": {}}
@@ -1106,6 +1579,10 @@ if __name__ == "__main__":
     model_checkpoints = []
     experiment_note = args.note.strip()
     experiment_seed = int(provisional["experiment_seed"])
+    tracking_group = args.wandb_group.strip() or (
+        f"{topology_scenario.name}-"
+        f"{experiment_note or 'comparison'}-seed{experiment_seed}"
+    )
     if experiment_note:
         print(f"Experiment note: {experiment_note}")
     print(f"Experiment seed: {experiment_seed}")
@@ -1147,20 +1624,46 @@ if __name__ == "__main__":
             baseline_episodes=BASELINE_EVALUATION_EPISODES,
         )
         algorithm_episode_counts[algo_name] = run_episodes
-        history, checkpoint = train_algorithm(
-            algo_name,
-            config,
-            devices,
-            servers,
-            network_env,
-            data_loader,
-            num_episodes=run_episodes,
-            priority_model=priority_model,
-            priority_mode=priority_model_name,
-            topology_scenario=topology_scenario,
-            topology_metrics=topology_metrics,
-            experiment_note=experiment_note,
+        experiment_tracker = initialize_experiment_tracker(
+            mode=args.wandb_mode,
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            run_name=f"{algo_name} - {topology_scenario.name}",
+            group=tracking_group,
+            notes=experiment_note,
+            config={
+                "algorithm": algo_name,
+                "agent_class": config["class"].__name__,
+                "agent_kwargs": dict(config.get("kwargs", {})),
+                "topology_scenario": topology_scenario.name,
+                "topology_metrics": topology_metrics,
+                "num_devices": len(devices),
+                "num_servers": len(servers),
+                "episodes": run_episodes,
+                "seed": experiment_seed,
+                "priority_model": priority_model_name,
+            },
         )
+        if experiment_tracker.url:
+            print(f"[{algo_name}] W&B: {experiment_tracker.url}")
+        try:
+            history, checkpoint = train_algorithm(
+                algo_name,
+                config,
+                devices,
+                servers,
+                network_env,
+                data_loader,
+                num_episodes=run_episodes,
+                priority_model=priority_model,
+                priority_mode=priority_model_name,
+                topology_scenario=topology_scenario,
+                topology_metrics=topology_metrics,
+                experiment_note=experiment_note,
+                experiment_tracker=experiment_tracker,
+            )
+        finally:
+            experiment_tracker.finish()
         results["reward"][algo_name] = history["reward"]
         results["delay"][algo_name] = history["delay"]
         results["energy"][algo_name] = history["energy"]

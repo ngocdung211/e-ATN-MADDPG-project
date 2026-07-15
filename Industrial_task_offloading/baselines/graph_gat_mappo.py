@@ -1,7 +1,7 @@
 """Graph-GAT MAPPO ablation agent."""
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 from models.topology_gat import TopologyGATEncoder
+from utils.gpu_readiness import resolve_torch_device
 from utils.topology_graph_state import TopologyGraphState
 
 
@@ -54,7 +55,12 @@ class GraphGATValueCritic(nn.Module):
 
     def forward(self, device_embeddings: torch.Tensor) -> torch.Tensor:
         """Return one scalar value for the joint graph state."""
-        joint_embedding = device_embeddings.reshape(1, -1)
+        if device_embeddings.ndim == 2:
+            joint_embedding = device_embeddings.reshape(1, -1)
+        else:
+            joint_embedding = device_embeddings.reshape(
+                *device_embeddings.shape[:-2], -1
+            )
         x = F.relu(self.fc1(joint_embedding))
         x = F.relu(self.fc2(x))
         return self.fc3(x)
@@ -149,13 +155,18 @@ class GraphGATMAPPOAgent:
         embedding_dim: int = 64,
         hidden_dim: int = 64,
         lr: float = 0.0001,
+        encoder_lr: Optional[float] = None,
         gamma: float = 0.99,
         clip_param: float = 0.2,
         ppo_epochs: int = 4,
+        entropy_coef: float = 0.01,
+        value_loss_coef: float = 1.0,
+        max_grad_norm: Optional[float] = None,
         use_action_mask: bool = True,
         topology_warmup_episodes: int = 0,
         topology_warmup_updates_per_step: int = 0,
         topology_warmup_lr: float = 0.001,
+        device: str = "cpu",
     ):
         """Initialize Graph-GAT MAPPO.
 
@@ -167,13 +178,20 @@ class GraphGATMAPPOAgent:
             embedding_dim: GAT device embedding dimension.
             hidden_dim: Hidden layer width.
             lr: Learning rate.
+            encoder_lr: Optional encoder-specific learning rate. Uses ``lr``
+                when omitted.
             gamma: Discount factor.
             clip_param: PPO clipping parameter.
             ppo_epochs: PPO epochs per rollout update.
+            entropy_coef: Entropy bonus coefficient in the actor loss.
+            value_loss_coef: Critic loss coefficient in the joint PPO loss.
+            max_grad_norm: Optional maximum PPO gradient norm.
             use_action_mask: Whether to mask disconnected edge-server actions.
             topology_warmup_episodes: Number of first episodes using online GAT warmup.
             topology_warmup_updates_per_step: Auxiliary GAT updates before action selection.
             topology_warmup_lr: Learning rate for topology warmup optimizer.
+            device: PyTorch device request: ``cpu``, ``cuda``, ``cuda:<index>``,
+                or ``auto``.
         """
         self.num_devices = num_devices
         self.num_servers = num_servers
@@ -181,9 +199,13 @@ class GraphGATMAPPOAgent:
         self.gamma = gamma
         self.clip_param = clip_param
         self.ppo_epochs = ppo_epochs
+        self.entropy_coef = entropy_coef
+        self.value_loss_coef = value_loss_coef
+        self.max_grad_norm = max_grad_norm
         self.use_action_mask = use_action_mask
         self.topology_warmup_episodes = topology_warmup_episodes
         self.topology_warmup_updates_per_step = topology_warmup_updates_per_step
+        self.device = resolve_torch_device(device)
 
         self.encoder = TopologyGATEncoder(
             node_feature_dim=node_feature_dim,
@@ -206,11 +228,27 @@ class GraphGATMAPPOAgent:
             num_servers=num_servers,
             hidden_dim=hidden_dim,
         )
-        self.optimizer = optim.Adam(
+        self.encoder.to(self.device)
+        self.actor.to(self.device)
+        self.critic.to(self.device)
+        self.topology_warmup_head.to(self.device)
+        self.ppo_parameters = (
             list(self.encoder.parameters())
             + list(self.actor.parameters())
-            + list(self.critic.parameters()),
-            lr=lr,
+            + list(self.critic.parameters())
+        )
+        self.optimizer = optim.Adam(
+            [
+                {
+                    "params": self.encoder.parameters(),
+                    "lr": lr if encoder_lr is None else encoder_lr,
+                },
+                {
+                    "params": list(self.actor.parameters())
+                    + list(self.critic.parameters()),
+                    "lr": lr,
+                },
+            ]
         )
         self.topology_warmup_optimizer = optim.Adam(
             list(self.encoder.parameters()) + list(self.topology_warmup_head.parameters()),
@@ -226,7 +264,10 @@ class GraphGATMAPPOAgent:
             distribution = Categorical(probabilities)
             actions = distribution.sample()
             log_probs = distribution.log_prob(actions)
-            return actions.tolist(), [float(value) for value in log_probs.tolist()]
+            return (
+                actions.detach().cpu().tolist(),
+                [float(value) for value in log_probs.detach().cpu().tolist()],
+            )
 
     def update_from_rollout(self, rollout_buffer: GraphGATRolloutBuffer) -> None:
         """Update encoder, actor, and critic from on-policy graph rollouts."""
@@ -235,18 +276,24 @@ class GraphGATMAPPOAgent:
             return
 
         actions = torch.tensor(
-            [transition.actions for transition in transitions], dtype=torch.long
+            [transition.actions for transition in transitions],
+            dtype=torch.long,
+            device=self.device,
         )
         rewards = torch.tensor(
-            [transition.rewards for transition in transitions], dtype=torch.float32
+            [transition.rewards for transition in transitions],
+            dtype=torch.float32,
+            device=self.device,
         )
         old_log_probs = torch.tensor(
             [transition.old_log_probs for transition in transitions],
             dtype=torch.float32,
+            device=self.device,
         )
         dones = torch.tensor(
             [[float(transition.done)] for transition in transitions],
             dtype=torch.float32,
+            device=self.device,
         )
         team_rewards = rewards.mean(dim=1, keepdim=True)
         graph_states = [transition.graph_state for transition in transitions]
@@ -272,22 +319,36 @@ class GraphGATMAPPOAgent:
             clipped = torch.clamp(
                 ratios, 1.0 - self.clip_param, 1.0 + self.clip_param
             ) * expanded_advantages
-            actor_loss = -torch.min(unclipped, clipped).mean() - 0.01 * entropy
+            actor_loss = (
+                -torch.min(unclipped, clipped).mean()
+                - self.entropy_coef * entropy
+            )
             critic_loss = F.mse_loss(values, target_values)
 
             self.optimizer.zero_grad()
-            (actor_loss + critic_loss).backward()
+            (actor_loss + self.value_loss_coef * critic_loss).backward()
+            if self.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.ppo_parameters, self.max_grad_norm
+                )
             self.optimizer.step()
 
         rollout_buffer.clear()
 
     def _encode_graph(self, graph_state: TopologyGraphState) -> torch.Tensor:
-        """Encode one topology graph into device embeddings."""
-        return self.encoder(
-            graph_state.node_features,
-            graph_state.edge_index,
-            graph_state.edge_features,
-            graph_state.device_node_indices,
+        """Encode the complete topology into global device embeddings."""
+        device_features = self._selected_node_features(
+            graph_state, graph_state.device_node_indices
+        )
+        server_features = self._selected_node_features(
+            graph_state, graph_state.server_node_indices
+        )
+        edge_features = self._device_server_edge_features(graph_state).to(self.device)
+        return self.encoder.forward_batched_global(
+            device_features=device_features,
+            server_features=server_features,
+            forward_edge_features=edge_features[:, :, 0, :],
+            backward_edge_features=edge_features[:, :, 1, :],
         )
 
     def should_warmup_topology(self, episode_index: int) -> bool:
@@ -329,31 +390,10 @@ class GraphGATMAPPOAgent:
         self, graph_state: TopologyGraphState
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Build feasible-link and window-length labels from graph edges."""
-        device = graph_state.node_features.device
-        feasible_targets = torch.zeros(
-            (self.num_devices, self.num_servers),
-            dtype=torch.float32,
-            device=device,
-        )
-        window_targets = torch.zeros_like(feasible_targets)
-        server_to_index = {
-            int(server_node): server_index
-            for server_index, server_node in enumerate(
-                graph_state.server_node_indices.tolist()
-            )
-        }
-
-        for edge_position, (source_node, target_node) in enumerate(
-            graph_state.edge_index.transpose(0, 1).tolist()
-        ):
-            if source_node >= self.num_devices or target_node not in server_to_index:
-                continue
-            server_index = server_to_index[target_node]
-            edge_features = graph_state.edge_features[edge_position]
-            feasible_targets[source_node, server_index] = edge_features[2]
-            window_targets[source_node, server_index] = edge_features[6]
-
-        return feasible_targets, window_targets
+        forward_edge_features = self._device_server_edge_features(
+            graph_state
+        ).to(self.device)[:, :, 0, :]
+        return forward_edge_features[:, :, 2], forward_edge_features[:, :, 6]
 
     def _actor_probabilities_for_graph_state(
         self, graph_state: TopologyGraphState
@@ -366,14 +406,47 @@ class GraphGATMAPPOAgent:
     def _encode_local_actor_embeddings(
         self, graph_state: TopologyGraphState
     ) -> torch.Tensor:
-        """Encode each device using only its device-server local subgraph."""
-        local_embeddings = []
-        for device_index in range(self.num_devices):
-            local_graph_state = self._local_subgraph_for_device(
-                graph_state, device_index
+        """Encode all independent device-server local graphs in one batch."""
+        device_features = self._selected_node_features(
+            graph_state, graph_state.device_node_indices
+        )
+        server_features = self._selected_node_features(
+            graph_state, graph_state.server_node_indices
+        )
+        edge_features = self._device_server_edge_features(graph_state).to(self.device)
+        return self.encoder.forward_batched_local(
+            device_features=device_features,
+            server_features=server_features,
+            forward_edge_features=edge_features[:, :, 0, :],
+            backward_edge_features=edge_features[:, :, 1, :],
+        )
+
+    def _selected_node_features(
+        self, graph_state: TopologyGraphState, node_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Select graph nodes and move their features to the agent device."""
+        graph_device = graph_state.node_features.device
+        selected_features = graph_state.node_features[
+            node_indices.to(graph_device)
+        ]
+        return selected_features.to(self.device)
+
+    def _device_server_edge_features(
+        self, graph_state: TopologyGraphState
+    ) -> torch.Tensor:
+        """Return ordered bidirectional link features shaped ``(N, S, 2, E)``."""
+        expected_edge_count = 2 * self.num_devices * self.num_servers
+        if graph_state.edge_features.shape[0] != expected_edge_count:
+            raise ValueError(
+                "topology graph must contain two directed edges per "
+                "device-server pair"
             )
-            local_embeddings.append(self._encode_graph(local_graph_state)[0])
-        return torch.stack(local_embeddings, dim=0)
+        return graph_state.edge_features.reshape(
+            self.num_devices,
+            self.num_servers,
+            2,
+            graph_state.edge_features.shape[-1],
+        )
 
     def _local_subgraph_for_device(
         self, graph_state: TopologyGraphState, device_index: int
@@ -440,26 +513,13 @@ class GraphGATMAPPOAgent:
         mask = torch.zeros(
             (self.num_devices, self.action_dim),
             dtype=torch.bool,
-            device=graph_state.node_features.device,
+            device=self.device,
         )
         mask[:, 0] = True
-
-        server_to_action = {
-            int(server_node): action_index + 1
-            for action_index, server_node in enumerate(
-                graph_state.server_node_indices.tolist()
-            )
-        }
-        for edge_index, (source_node, target_node) in enumerate(
-            graph_state.edge_index.transpose(0, 1).tolist()
-        ):
-            if source_node >= self.num_devices or target_node not in server_to_action:
-                continue
-
-            is_connected = graph_state.edge_features[edge_index, 2] > 0.5
-            if is_connected:
-                mask[source_node, server_to_action[target_node]] = True
-
+        forward_edge_features = self._device_server_edge_features(
+            graph_state
+        ).to(self.device)[:, :, 0, :]
+        mask[:, 1:] = forward_edge_features[:, :, 2] > 0.5
         return mask
 
     def _masked_action_probabilities(
@@ -469,42 +529,114 @@ class GraphGATMAPPOAgent:
         if not self.use_action_mask:
             return probabilities
 
-        action_mask = self._action_mask_for_graph_state(graph_state).to(
-            device=probabilities.device
+        forward_edge_features = self._device_server_edge_features(
+            graph_state
+        ).to(self.device)[:, :, 0, :]
+        return self._masked_action_probabilities_for_edges(
+            probabilities, forward_edge_features
         )
+
+    def _masked_action_probabilities_for_edges(
+        self,
+        probabilities: torch.Tensor,
+        forward_edge_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply link masks to single-state or rollout action probabilities."""
+        if not self.use_action_mask:
+            return probabilities
+
+        action_mask = torch.zeros_like(probabilities, dtype=torch.bool)
+        action_mask[..., 0] = True
+        action_mask[..., 1:] = forward_edge_features[..., 2] > 0.5
         masked_probabilities = probabilities * action_mask.float()
-        probability_sum = masked_probabilities.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        probability_sum = masked_probabilities.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-8)
         return masked_probabilities / probability_sum
+
+    def _stack_graph_features(
+        self, graph_states: List[TopologyGraphState]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stack rollout graph features into fixed-shape time-batch tensors."""
+        device_features = torch.stack(
+            [
+                graph_state.node_features[graph_state.device_node_indices]
+                for graph_state in graph_states
+            ]
+        )
+        server_features = torch.stack(
+            [
+                graph_state.node_features[graph_state.server_node_indices]
+                for graph_state in graph_states
+            ]
+        )
+        edge_features = torch.stack(
+            [
+                self._device_server_edge_features(graph_state)
+                for graph_state in graph_states
+            ]
+        )
+        return (
+            device_features.to(self.device),
+            server_features.to(self.device),
+            edge_features[:, :, :, 0, :].to(self.device),
+            edge_features[:, :, :, 1, :].to(self.device),
+        )
 
     def _values_for_graphs(
         self, graph_states: List[TopologyGraphState]
     ) -> torch.Tensor:
         """Return centralized values for a batch of graph states."""
-        values = [
-            self.critic(self._encode_graph(graph_state))
-            for graph_state in graph_states
-        ]
-        return torch.cat(values, dim=0)
+        (
+            device_features,
+            server_features,
+            forward_edge_features,
+            backward_edge_features,
+        ) = self._stack_graph_features(graph_states)
+        device_embeddings = self.encoder.forward_batched_global_rollout(
+            device_features,
+            server_features,
+            forward_edge_features,
+            backward_edge_features,
+        )
+        return self.critic(device_embeddings)
 
     def _policy_and_values_for_graphs(
         self,
         graph_states: List[TopologyGraphState],
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return action log-probs and values while reusing graph embeddings."""
-        log_prob_rows = []
-        entropy_rows = []
-        value_rows = []
-        for graph_index, graph_state in enumerate(graph_states):
-            probabilities = self._actor_probabilities_for_graph_state(graph_state)
-            distribution = Categorical(probabilities)
-            log_prob_rows.append(distribution.log_prob(actions[graph_index]))
-            entropy_rows.append(distribution.entropy())
-            device_embeddings = self._encode_graph(graph_state)
-            value_rows.append(self.critic(device_embeddings))
-
-        return (
-            torch.stack(log_prob_rows),
-            torch.stack(entropy_rows).mean(),
-            torch.cat(value_rows, dim=0),
+        """Return batched rollout action log-probabilities and values."""
+        actions = actions.to(self.device)
+        (
+            device_features,
+            server_features,
+            forward_edge_features,
+            backward_edge_features,
+        ) = self._stack_graph_features(graph_states)
+        local_embeddings = self.encoder.forward_batched_local_rollout(
+            device_features,
+            server_features,
+            forward_edge_features,
+            backward_edge_features,
         )
+        probabilities = self._masked_action_probabilities_for_edges(
+            self.actor(local_embeddings), forward_edge_features
+        )
+        distribution = Categorical(probabilities)
+        global_embeddings = self.encoder.forward_batched_global_rollout(
+            device_features,
+            server_features,
+            forward_edge_features,
+            backward_edge_features,
+        )
+        return (
+            distribution.log_prob(actions),
+            distribution.entropy().mean(),
+            self.critic(global_embeddings),
+        )
+
+    def synchronize_device(self) -> None:
+        """Wait for pending CUDA work so wall-clock timings are accurate."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)

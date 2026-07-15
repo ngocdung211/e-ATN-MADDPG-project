@@ -1,4 +1,4 @@
-"""Helper functions to build DAGs and GCN priorities."""
+"""Helper functions to build DAGs and task-priority graph models."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from dataset.data_loader import KolektorSDDLoader
 from environment.system_model import IndustrialDevice, Subtask, TaskDAG
 from models.gcn import TaskPriorityGCN
 from models.task_priority_gat import TaskPriorityGAT
-from utils.graph_utils import extract_gcn_inputs
+from utils.graph_utils import extract_task_graph_inputs
 
 
 DEFAULT_DAG_EDGES = [(1, 2), (1, 3), (2, 4), (3, 4), (4, 5)]
@@ -94,30 +94,32 @@ def generate_task_dags_for_episode(
     return task_dags
 
 
-def build_priorities(task_dags: Dict[int, TaskDAG], gcn_model: torch.nn.Module) -> Dict[int, List[int]]:
-    """Build execution priorities per device using the GCN model.
+def build_priorities(
+    task_dags: Dict[int, TaskDAG], priority_model: torch.nn.Module
+) -> Dict[int, List[int]]:
+    """Build execution priorities per device using a priority graph model.
 
     Args:
         task_dags: Task DAGs keyed by device ID.
-        gcn_model: Trained GCN model.
+        priority_model: Trained GCN or GAT priority model.
 
     Returns:
         Mapping of device IDs to priority-ordered subtask IDs.
     """
     priorities: Dict[int, List[int]] = {}
     for device_id, task_dag in task_dags.items():
-        features, adjacency = extract_gcn_inputs(task_dag)
+        features, adjacency = extract_task_graph_inputs(task_dag)
         with torch.no_grad():
-            scores = gcn_model(features, adjacency)
+            scores = priority_model(features, adjacency)
         sorted_indices = torch.argsort(scores.squeeze(), descending=True).tolist()
         priorities[device_id] = [idx + 1 for idx in sorted_indices]
     return priorities
 
 
-def make_gcn_dag_sampler(
+def make_priority_dag_sampler(
     data_loader: KolektorSDDLoader, t_max: float = 1.0, e_max: float = 1.0
 ) -> Callable[[], TaskDAG]:
-    """Create a callable that samples TaskDAGs for GCN training.
+    """Create a callable that samples TaskDAGs for priority-model training.
 
     Args:
         data_loader: Dataset loader for random task parameters.

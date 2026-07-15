@@ -29,7 +29,8 @@ def build_topology_graph_state(
         num_servers: Number of edge-server nodes.
 
     Returns:
-        Topology graph state with shared node features and bidirectional valid links.
+        Topology graph state with shared node features and bidirectional links.
+        Edges are ordered by device, server, then forward/backward direction.
 
     Raises:
         ValueError: If the flat state dimensions are incompatible.

@@ -1,16 +1,16 @@
 # Windows GPU Readiness
 
-This project currently keeps training logic CPU-safe by default. GPU work should
-start with a readiness check before any model code is moved to CUDA.
+This project keeps environment simulation and graph construction on CPU. The
+Graph-GAT MAPPO model can run on CPU or CUDA, but GPU experiments should still
+start with a readiness check.
 
 ## Scope
 
-- This is only a CUDA environment check.
-- It does not change `run_comparision.py`, `main.py`, or any agent training
-  logic.
-- The Mac demo path should keep running as before.
-- Full CUDA tensor/model migration should wait until the Windows machine proves
-  that PyTorch can see the RTX 4080.
+- `utils.gpu_readiness` checks the CUDA-enabled PyTorch installation.
+- Only Graph-GAT MAPPO modules and their model-input tensors move to CUDA.
+- Environment simulation, topology graph construction, and rollout storage stay
+  on CPU.
+- The Mac path selects CPU automatically and remains the control path.
 
 ## Install PyTorch on Windows
 
@@ -52,20 +52,15 @@ GPU readiness report
   Selected device: cuda
 ```
 
-If `CUDA available` is `False`, do not change model code yet. Fix the Windows
-driver or PyTorch installation first.
+If `CUDA available` is `False`, fix the Windows driver or PyTorch installation
+before starting a CUDA experiment. An explicit `cuda` request fails instead of
+silently falling back to CPU.
 
 For machine-readable output:
 
 ```bash
 python -m utils.gpu_readiness --preferred-device cuda --json
 ```
-
-## Next Decision
-
-Only after the readiness check passes should one training path move to CUDA.
-The first selected target is `Graph-GAT MAPPO`, because it is the slowest active
-training path.
 
 ## Graph-GAT MAPPO Device Setting
 
@@ -89,3 +84,25 @@ Recommended server setting after readiness passes:
 
 This setting only affects `Graph-GAT MAPPO`. The environment simulation and
 other algorithms remain unchanged.
+
+The command-line option overrides the configuration without editing the file:
+
+```bash
+python run_comparision.py \
+  --topology-scenario paper_10d_3s \
+  --episodes 1 \
+  --baseline-episodes 1 \
+  --graph-gat-device cuda \
+  --note gpu-smoke
+```
+
+The startup line must report `Graph-GAT device: cuda`. The CUDA test also runs
+automatically on a GPU machine:
+
+```bash
+pytest tests/test_gpu_readiness.py tests/test_graph_gat_mappo.py -q
+```
+
+After the smoke run succeeds, repeat it on `medium_20d_6s` and
+`large_30d_10s`, record Graph-GAT action/update time, and compare against the
+same command with `--graph-gat-device cpu`.
