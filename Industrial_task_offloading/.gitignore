@@ -33,3 +33,4 @@ tests/*
 !tests/test_experiment_tracking.py
 plots/
 wandb/
+paper/
