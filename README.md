@@ -332,25 +332,3 @@ The README intentionally does not quote performance improvements because no
 versioned final benchmark outputs are currently committed. Add measured results
 only after the corresponding configuration, seeds, and artifacts are available.
 
-## Paper
-
-The IEEE manuscript is located at:
-
-```text
-Industrial_task_offloading/paper/manuscript/Final_report.tex
-```
-
-Title: **Graph Attention and DRL for Task Offloading in Industrial Image
-Recognition over Dynamic Digital Twin Edge Networks**
-
-Author: **Dung Do**, Department of Computer Science and Engineering, Yuan Ze
-University, Taiwan.
-
-The manuscript can be uploaded to Overleaf together with `IEEEtran.cls`,
-`references.bib`, and the files referenced by the LaTeX source.
-
-## License
-
-No license file is currently included. Unless the owner adds a license, standard
-copyright restrictions apply. Third-party datasets, papers, and dependencies
-remain subject to their own licenses and terms.
